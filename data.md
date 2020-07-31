@@ -641,6 +641,56 @@ sliceB := sliceA[0:5]
 
 # ==----------------哈希表------------==
 
+<font color=red size=5x>==`知识点总结`==</font>
+
+
+
+1. map 分为hmap和bmap
+
+   - hmap 中有count 记录元素个数,所以len事件复杂度是O(1)
+   - hmap中bucket只想每个bucket的地址
+   - overflow指向溢出的bucket,每个bucket只能存储8个键值对
+   - oldbuckets 是map进行rehash的时候使用的,为bucket的一半,进行rehash的时候为了防止造成延迟,每次只会进行搬迁2两个元素
+   - overflow 和bucket是一块内存
+
+2. bamp是bucket结构,其中存储key的高8位,减少元素的访问时间,低8位用来和bucket操作,存储于哪个bucket中
+
+3. 在bmap中key-key...  value-value...这样存储,减少字节对齐造成空间浪费
+
+4. map初始化的时候,如果元素少于等25个的时候,直接进行hash初始化,大于25个的时候会进行key分组和value分组,然后进行map初始化,
+
+   ```
+   字面两初始化
+   hash := map[string]int{ 
+   "1": 2,
+   "3": 4,
+   "5": 6,
+   }
+   
+   运行时初始化
+   hash := make(map[string]int, 3)
+   
+   hash["1"] = 2
+   
+   hash["3"] = 4
+   
+   hash["5"] = 6
+   
+   
+   
+   hash := make(map[string]int, 3)
+   
+   hash["1"] = 2
+   
+   hash["3"] = 4
+   
+   hash["5"] = 6
+   ```
+
+   无论哪种初始化,都会调用make函数进行,然后在分配key和value
+
+5. 初始化过程,先判断用bucket的个数是否超过 2^4个,没超过就会省略创建溢出桶,超过的时候会创建2^(B-4)个溢出桶
+
 ## 设计原理
 
 哈希函数和冲突解决方法
@@ -745,10 +795,12 @@ type hmap struct {
 }
 ```
 
-- `count` 表示当前哈希表中的元素数量；len时间复杂度是O(1)
-- `B` 表示当前哈希表持有的 `buckets` 数量，但是因为哈希表中桶的数量都 2 的倍数，所以该字段会存储对数，也就是 `len(buckets) == 2^B`；
+- `count` 表示当前哈希表中的元素数量；<font color=red size=5x>len时间复杂度是O(1)</font>
+- `B` 表示当前哈希表持有的 `buckets` 数量，但是因为哈希表中桶的数量都 2 的倍数，所以该字段会存储对数，也就是 `len(buckets) == 2^B`；<font color=red size=5x>2倍的扩容</font>
 - `hash0` 是哈希的种子，它能为哈希函数的结果引入随机性，这个值在创建哈希表时确定，并在调用哈希函数时作为参数传入；
 - `oldbuckets` 是哈希在扩容时用于保存之前 `buckets` 的字段，它的大小是当前 `buckets` 的一半；
+- `noverflow`是溢出的bucket的数量
+- `extra *mapextra`指向溢出桶的地址
 
 
 
@@ -756,29 +808,187 @@ type hmap struct {
 
 **图 3-12 哈希表的数据结构**
 
-如上图所示哈希表 `hmap` 的桶就是 `bmap`，<font color=red size=5x>==每一个 `bmap` 都能存储 8 个键值对==，当哈希表中存储的数据过多，单个桶无法装满时就会使用 `extra.overflow` 中桶存储溢出的数据。</font>上述两种不同的桶在内存中是连续存储的，我们在这里将它们分别称为正常桶和溢出桶，上图中黄色的 `bmap` 就是正常桶，绿色的 `bmap` 是溢出桶，溢出桶是在 Go 语言还使用 C 语言实现时就使用的设计[3](https://www.bookstack.cn/read/draveness-golang/8a6fa5746b8fbe7e.md#fn:3)，由于它能够减少扩容的频率所以一直使用至今。
+<font color=red size=5x>bmap结构</font>
+
+如上图所示哈希表 `hmap` 的桶就是 `bmap`，<font color=red size=5x>==每一个 `bmap` 都能存储 8 个键值对==，当哈希表中存储的数据过多，单个桶无法装满时就会使用 `extra.overflow` 中桶存储溢出的数据。</font>==上述两种不同的桶在内存中是连续存储的，我们在这里将它们分别称为正常桶和溢出桶==，上图中黄色的 `bmap` 就是正常桶，绿色的 `bmap` 是溢出桶，溢出桶是在 Go 语言还使用 C 语言实现时就使用的设计[3](https://www.bookstack.cn/read/draveness-golang/8a6fa5746b8fbe7e.md#fn:3)，由于它能够减少扩容的频率所以一直使用至今。
 
 这个桶的结构体 `bmap` 在 Go 语言源代码中的定义只包含一个简单的 `tophash` 字段，`tophash` 存储了键的哈希的高 8 位，通过比较不同键的哈希的高 8 位可以减少访问键值对次数以提高性能：
 
 ```
-type bmap struct {    
-	tophash [bucketCnt]uint8
+type bmap struct {
+    tophash [8]uint8 //存储哈希值的高8位
+    data    byte[1]  //key value数据:key/key/key/.../value/value/value...
+    overflow *bmap   //溢出bucket的地址
 }
 ```
 
-`bmap` 结构体其实不止包含 `tophash` 字段，由于哈希表中可能存储不同类型的键值对并且 Go 语言也不支持泛型，所以键值对占据的内存空间大小只能在编译时进行推导，这些字段在运行时也都是通过计算内存地址的方式直接访问的，所以它的定义中就没有包含这些字段，但是我们能根据编译期间的 [`cmd/compile/internal/gc.bmap`](https://github.com/golang/go/blob/be64a19d99918c843f8555aad580221207ea35bc/src/cmd/compile/internal/gc/reflect.go#L82-L187) 函数对它的结构重建：
+<font color=red size=4x>`bmap` 结构体其实不止包含 `tophash` 字段，由于哈希表中可能存储不同类型的键值对并且 Go 语言也不支持泛型，所以键值对占据的内存空间大小只能在编译时进行推导</font>，这些字段在运行时也都是通过计算内存地址的方式直接访问的，所以它的定义中就没有包含这些字段，但是我们能根据编译期间的 [`cmd/compile/internal/gc.bmap`](https://github.com/golang/go/blob/be64a19d99918c843f8555aad580221207ea35bc/src/cmd/compile/internal/gc/reflect.go#L82-L187) 函数对它的结构重建：
 
-```
-type bmap struct {    topbits  [8]uint8    keys     [8]keytype    values   [8]valuetype    pad      uintptr    overflow uintptr}
+```go
+type bmap struct {    
+	topbits  [8]uint8    
+	keys     [8]keytype    
+	values   [8]valuetype    
+	pad      uintptr    o
+	verflow uintptr
+}
 ```
 
 如果哈希表存储的数据逐渐增多，我们会对哈希表进行扩容或者使用额外的桶存储溢出的数据，不会让单个桶中的数据超过 8 个，不过溢出桶只是临时的解决方案，创建过多的溢出桶最终也会导致哈希的扩容。
 
-从 Go 语言哈希的定义中就可以发现，它比前面两节提到的数组和切片复杂得多，结构体中不仅包含大量字段，还使用了较多的复杂结构，在后面的小节中我们会详细介绍不同字段的作用。
+每个bucket可以存储8个键值对。
+
+- tophash是个长度为8的数组，哈希值相同的键（准确的说是哈希值低位相同的键）存入当前bucket时会将哈希值的高位存储在该数组中，以方便后续匹配。
+- data区存放的是key-value数据，存放顺序是key/key/key/…value/value/value，如此存放是为了节省字节对齐带来的空间浪费。
+- overflow 指针指向的是下一个bucket，据此将所有冲突的键连接起来。
+
+![img](data.assets/map-02-struct_sketch.png)
+
+<font color=red size=5x>bmap哈希冲突处理</font>
+
+当有两个或以上数量的键被哈希到了同一个bucket时，我们称这些键发生了冲突。Go使用链地址法来解决键冲突。由于每个bucket可以存放8个键值对，所以同一个bucket存放超过8个键值对时就会再创建一个键值对，用类似链表的方式将bucket连接起来。
+
+下图展示产生冲突后的map：
+
+![1.3 map - 图3](data.assets/map-03-struct_sketch.png)
+
+bucket数据结构指示下一个bucket的指针称为overflow bucket，意为当前bucket盛不下而溢出的部分。事实上哈希冲突并不是好事情，它降低了存取效率，好的哈希算法可以保证哈希值的随机性，但冲突过多也是要控制的，后面会再详细介绍。
+
+## 初始化
+
+既然已经介绍了常见哈希表的基本原理和实现方法，那么可以开始分析 Go 语言中哈希表的实现，首先要分析的就是在 Go 语言中初始化哈希的两种方法 — 通过字面量和运行时。
+
+### 字面量
+
+目前的现代编程语言基本都支持使用字面量的方式初始化哈希，一般都会使用 `key: value` 的语法来表示键值对，Go 语言中也不例外：
+
+```
+hash := map[string]int{ 
+"1": 2,
+"3": 4,
+"5": 6,
+}
+```
+
+我们需要在初始化哈希时声明键值对的类型，这种使用字面量初始化的方式最终都会通过 [`cmd/compile/internal/gc.maplit`](https://github.com/golang/go/blob/f07059d949057f414dd0f8303f93ca727d716c62/src/cmd/compile/internal/gc/sinit.go#L768-L873) 函数初始化，我们来分析一下 [`cmd/compile/internal/gc.maplit`](https://github.com/golang/go/blob/f07059d949057f414dd0f8303f93ca727d716c62/src/cmd/compile/internal/gc/sinit.go#L768-L873) 函数初始化哈希的过程：
+
+```go
+func maplit(n *Node, m *Node, init *Nodes) { 
+	a := nod(OMAKE, nil, nil)    
+	a.Esc = n.Esc    
+	a.List.Set2(typenod(n.Type), nodintconst(int64(n.List.Len())))    
+	litas(m, a, init)    
+	
+	var stat, dyn []*Node    
+	for _, r := range n.List.Slice() {
+  	stat = append(stat, r)    
+  }    
+  
+  if len(stat) > 25 {
+  	...    
+  	} else {
+    	addMapEntries(m, stat, init)    
+    	}
+   }
+```
+
+当哈希表中的元素数量少于或者等于 25 个时，编译器会直接调用 `addMapEntries` 将字面量初始化的结构体转换成以下的代码，将所有的键值对一次加入到哈希表中：
 
 
 
+```
+hash := make(map[string]int, 3)
 
+hash["1"] = 2
+
+hash["3"] = 4
+
+hash["5"] = 6
+```
+
+这种初始化的方式与前面两节分析的[数组](https://www.bookstack.cn/read/draveness-golang/79255565262cc9f6.md)和[切片](https://www.bookstack.cn/read/draveness-golang/bc59e924b285e5e9.md)的几乎完全相同，由此看来集合类型的初始化在 Go 语言中有着相同的处理方式和逻辑。
+
+<font color=red size=5x>一旦哈希表中元素的数量超过了 25 个，就会在编译期间创建两个数组分别存储键和值的信息，这些键值对会通过一个如下所示的 for 循环加入目标的哈希：</font>
+
+```
+hash := make(map[string]int, 26)
+
+vstatk := []string{"1", "2", "3", ... ， "26"}
+
+vstatv := []int{1, 2, 3, ... , 26}
+for i := 0; i < len(vstak); i++ { 
+	hash[vstatk[i]] = vstatv[i]
+}
+```
+
+这里展开的两个切片 `vstatk` 和 `vstatv` 还会被编辑器继续展开，具体的展开方式可以阅读上一节了解[切片的初始化](https://www.bookstack.cn/read/draveness-golang/bc59e924b285e5e9.md)，不过无论使用哪种方法，使用字面量初始化的过程都会使用 Go 语言中的关键字 `make` 来创建新的哈希并通过最原始的 `[]` 语法向哈希追加元素。
+
+### 运行时
+
+无论 `make` 是从哪里来的，只要我们使用 `make` 创建哈希，Go 语言编译器都会在[类型检查](https://www.bookstack.cn/read/draveness-golang/7ab240185c175c73.md)期间将它们转换成对 [`runtime.makemap`](https://github.com/golang/go/blob/dcd3b2c173b77d93be1c391e3b5f932e0779fb1f/src/runtime/map.go#L303-L336) 的调用，使用字面量来初始化哈希也只是语言提供的辅助工具，最后调用的都是 [`runtime.makemap`](https://github.com/golang/go/blob/dcd3b2c173b77d93be1c391e3b5f932e0779fb1f/src/runtime/map.go#L303-L336)：
+
+```go
+func makemap(t *maptype, hint int, h *hmap) *hmap { 
+	mem, overflow := math.MulUintptr(uintptr(hint), t.bucket.size)   
+  if overflow || mem > maxAlloc {    
+  	hint = 0    
+  }    
+  
+  if h == nil { 
+  	h = new(hmap)   
+  }    
+  
+  h.hash0 = fastrand()   
+  B := uint8(0)    
+  for overLoadFactor(hint, B) {  
+  	B++    
+  }   
+  
+  h.B = B   
+  if h.B != 0 {        
+  	var nextOverflow *bmap       
+    h.buckets, nextOverflow = makeBucketArray(t, h.B, nil)       
+    
+    if nextOverflow != nil {            
+    	h.extra = new(mapextra)           
+      h.extra.nextOverflow = nextOverflow       
+     }    
+   }    
+   
+   return h
+}
+```
+
+这个函数的执行过程会分成以下几个部分：
+
+- 计算哈希占用的内存是否溢出或者超出能分配的最大值；
+- 调用 `fastrand` 获取一个随机的哈希种子；
+- 根据传入的 `hint` 计算出需要的最小需要的桶的数量；
+- 使用 [`runtime.makeBucketArray`](https://github.com/golang/go/blob/dcd3b2c173b77d93be1c391e3b5f932e0779fb1f/src/runtime/map.go#L344-L387) 创建用于保存桶的数组；[`runtime.makeBucketArray`](https://github.com/golang/go/blob/dcd3b2c173b77d93be1c391e3b5f932e0779fb1f/src/runtime/map.go#L344-L387) 函数会根据传入的 `B` 计算出的需要创建的桶数量在内存中分配一片连续的空间用于存储数据：
+
+```go
+func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets unsafe.Pointer, nextOverflow *bmap) {    
+	base := bucketShift(b)    nbuckets := base    
+	if b >= 4 {        
+		nbuckets += bucketShift(b - 4)        
+		sz := t.bucket.size * nbuckets        
+		up := roundupsize(sz)        
+		if up != sz {           
+    	nbuckets = up / t.bucket.size       
+      }
+    }    
+    
+    buckets = newarray(t.bucket, int(nbuckets))   
+    if base != nbuckets {        
+    	nextOverflow = (*bmap)(add(buckets, base*uintptr(t.bucketsize)))        
+    	last := (*bmap)(add(buckets, (nbuckets-1)*uintptr(t.bucketsize)))        last.setoverflow(t, (*bmap)(buckets))    
+    }    
+    
+    return buckets, nextOverflow
+}
+```
+
+当桶的数量小于 $2^4$ 时，由于数据较少、使用溢出桶的可能性较低，这时就会省略创建的过程以减少额外开销；当桶的数量多于 $2^4$ 时，就会额外创建 $2^{B-4}$ 个溢出桶，根据上述代码，我们能确定正常桶和溢出桶在内存中的存储空间是连续的，只是被 `hmap` 中的不同字段引用。
 
 
 
