@@ -1,4 +1,4 @@
-# ==-------------基本数据类型------==
+# ==-------------基本数据类型-----==
 
 1.bit(位): 二进制数中的一个数位，可以是0或者1，是计算机中数据的最小单位。二进制的一个“0”或一个“1”叫一位
 2.Byte(字节): 计算机中数据的基本单位，每8位组成一个字节
@@ -152,7 +152,7 @@ func main() {
 
 布尔类型：false
 
-#  ==----------chan数据结构----------==
+#  ==----------chan数据结构--------==
 
 `src/runtime/chan.go:hchan`定义了channel的数据结构：
 
@@ -378,7 +378,7 @@ func chanRange(chanName chan int) {
 
 
 
-# ==-------------slice------------==
+# ==-------------slice------------------==
 
 ## 总结
 
@@ -641,9 +641,9 @@ sliceB := sliceA[0:5]
 
 # ==----------------哈希表------------==
 
-<font color=red size=5x>==`知识点总结`==</font>
+https://segmentfault.com/a/1190000018380327?utm_source=tag-newest
 
-
+## <font color=red size=5x>==`知识点总结`==</font>
 
 1. map 分为hmap和bmap
 
@@ -657,7 +657,7 @@ sliceB := sliceA[0:5]
 
 3. 在bmap中key-key...  value-value...这样存储,减少字节对齐造成空间浪费
 
-4. map初始化的时候,如果元素少于等25个的时候,直接进行hash初始化,大于25个的时候会进行key分组和value分组,然后进行map初始化,
+4. <font color=red>map初始化的时候,如果元素少于等25个的时候,直接进行hash初始化,大于25个的时候会进行key分组和value分组,然后进行map初始化,</font>
 
    ```
    字面两初始化
@@ -690,6 +690,33 @@ sliceB := sliceA[0:5]
    无论哪种初始化,都会调用make函数进行,然后在分配key和value
 
 5. 初始化过程,先判断用bucket的个数是否超过 2^4个,没超过就会省略创建溢出桶,超过的时候会创建2^(B-4)个溢出桶
+
+6. **因为把高八位存储起来，这样不用完整比较key就能过滤掉不符合的key，加快查询速度**当一个哈希值的高8位和存储的高8位相符合，再去比较完整的key值，进而取出value。
+
+7. 在golang map中出现冲突时，不是每一个key都申请一个结构通过链表串起来，**而是以bmap为最小粒度挂载，一个bmap可以放8个key和value。这样减少对象数量，减轻管理内存的负担，利于gc。**
+    如果插入时，bmap中key超过8，那么就会申请一个新的bmap（overflow bucket）挂在这个bmap的后面形成链表，**优先用预分配的overflow bucket，如果预分配的用完了，那么就malloc一个挂上去。注意golang的map不会shrink，内存只会越用越多，overflow bucket中的key全删了也不会释放**
+
+8. bmap 第二部分，存储的是key 和value，就是我们传入的key和value，注意，它的底层排列方式是，key全部放在一起，value全部放在一起。**当key大于128字节时，bucket的key字段存储的会是指针，指向key的实际内容；value也是一样。**
+
+   ![key和value排列](data/1460000018385918.png)
+
+9. go语言的map通过数组+链表的方式实现了hash表，同时分散各个桶，使用链表法+bucket内部的寻址法解决了碰撞冲突，也提高了效率。因为即使链表很长了，go会根据装载因子，去扩容整个bucket数组，所以下面就要看下扩容。
+
+   
+
+10. 扩容
+
+    - 当链表越来越长，bucket的扩容次数达到一定值，其实是bmap扩容的加载因数达到6.5，bmap就会进行扩容，将原来bucket数组数量扩充一倍，产生一个新的bucket数组，也就是bmap的buckets属性指向的数组。这样bmap中的oldbuckets属性指向的就是旧bucket数组。
+    - 这里的加载因子LoadFactor是一个阈值，计算方式为（map长度/2^B ）如果超过6.5，将会进行扩容，这个是经过测试才得出的合理的一个阈值。因为，加载因子越小，空间利用率就小，加载因子越大，产生冲突的几率就大。所以6.5是一个平衡的值。
+    - map的扩容不会立马全部复制，而是渐进式扩容，即首先开辟2倍的内存空间，创建一个新的bucket数组。只有当访问原来就的bucket数组时，才会将就得bucket拷贝到新的bucket数组，进行渐进式的扩容。当然旧的数据不会删除，而是去掉引用，等待gc回收。
+
+    
+
+<font color=red size=5x>hmap 和bmap结构图</font>
+
+![在这里插入图片描述](data/1460000018385919.png)
+
+1. 
 
 ## 设计原理
 
@@ -781,17 +808,19 @@ Key11 展示了一个键在哈希表中不存在的例子，当哈希表发现�
 Go 语言运行时同时使用了多个数据结构组合表示哈希表，其中使用 [`hmap`](https://github.com/golang/go/blob/ed15e82413c7b16e21a493f5a647f68b46e965ee/src/runtime/map.go#L115-L129) 结构体来表示哈希，我们先来看一下这个结构体内部的字段：
 
 ```go
-type hmap struct {    
-  count     int    
-  flags     uint8    
-  B         uint8    
-  noverflow uint16    
-  hash0     uint32    
-  buckets    unsafe.Pointer    
-  oldbuckets unsafe.Pointer    
-  nevacuate  uintptr   
-  
-  extra *mapextra
+// Go map的一个header结构
+type hmap struct {
+    count     int // map的大小.  len()函数就取的这个值
+    flags     uint8 //map状态标识
+    B         uint8  // 可以最多容纳 6.5 * 2 ^ B 个元素，6.5为装载因子即:map长度=6.5*2^B
+                    //B可以理解为buckets已扩容的次数
+    noverflow uint16 // 溢出buckets的数量
+    hash0     uint32 // hash 种子
+
+    buckets    unsafe.Pointer //指向最大2^B个Buckets数组的指针. count==0时为nil.
+    oldbuckets unsafe.Pointer //指向扩容之前的buckets数组，并且容量是现在一半.不增长就为nil
+    nevacuate  uintptr  // 搬迁进度，小于nevacuate的已经搬迁
+    extra *mapextra // 可选字段，额外信息
 }
 ```
 
@@ -814,11 +843,18 @@ type hmap struct {
 
 这个桶的结构体 `bmap` 在 Go 语言源代码中的定义只包含一个简单的 `tophash` 字段，`tophash` 存储了键的哈希的高 8 位，通过比较不同键的哈希的高 8 位可以减少访问键值对次数以提高性能：
 
-```
+```go
 type bmap struct {
     tophash [8]uint8 //存储哈希值的高8位
     data    byte[1]  //key value数据:key/key/key/.../value/value/value...
     overflow *bmap   //溢出bucket的地址
+}
+// Go map 的 buckets结构
+type bmap struct {
+    // 每个元素hash值的高8位，如果tophash[0] < minTopHash，表示这个桶的搬迁状态
+    tophash [bucketCnt]uint8
+  // 第二个是8个key、8个value，但是我们不能直接看到；为了优化对齐，go采用了key放在一起，value放在一起的存储方式，
+   // 第三个是溢出时，下一个溢出桶的地址
 }
 ```
 
@@ -839,8 +875,14 @@ type bmap struct {
 每个bucket可以存储8个键值对。
 
 - tophash是个长度为8的数组，哈希值相同的键（准确的说是哈希值低位相同的键）存入当前bucket时会将哈希值的高位存储在该数组中，以方便后续匹配。
+
 - data区存放的是key-value数据，存放顺序是key/key/key/…value/value/value，如此存放是为了节省字节对齐带来的空间浪费。
+
 - overflow 指针指向的是下一个bucket，据此将所有冲突的键连接起来。
+
+- 第二部分，存储的是key 和value，就是我们传入的key和value，注意，它的底层排列方式是，key全部放在一起，value全部放在一起。**当key大于128字节时，bucket的key字段存储的会是指针，指向key的实际内容；value也是一样。**
+
+  
 
 ![img](data.assets/map-02-struct_sketch.png)
 
@@ -990,9 +1032,15 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 
 当桶的数量小于 $2^4$ 时，由于数据较少、使用溢出桶的可能性较低，这时就会省略创建的过程以减少额外开销；当桶的数量多于 $2^4$ 时，就会额外创建 $2^{B-4}$ 个溢出桶，根据上述代码，我们能确定正常桶和溢出桶在内存中的存储空间是连续的，只是被 `hmap` 中的不同字段引用。
 
+## 读写操作
 
 
 
+## 扩容
+
+- 当链表越来越长，bucket的扩容次数达到一定值，其实是bmap扩容的加载因数达到6.5，bmap就会进行扩容，将原来bucket数组数量扩充一倍，产生一个新的bucket数组，也就是bmap的buckets属性指向的数组。这样bmap中的oldbuckets属性指向的就是旧bucket数组。
+- 这里的加载因子LoadFactor是一个阈值，计算方式为（map长度/2^B ）如果超过6.5，将会进行扩容，这个是经过测试才得出的合理的一个阈值。因为，加载因子越小，空间利用率就小，加载因子越大，产生冲突的几率就大。所以6.5是一个平衡的值。
+- map的扩容不会立马全部复制，而是渐进式扩容，即首先开辟2倍的内存空间，创建一个新的bucket数组。只有当访问原来就的bucket数组时，才会将就得bucket拷贝到新的bucket数组，进行渐进式的扩容。当然旧的数据不会删除，而是去掉引用，等待gc回收。
 
 
 
