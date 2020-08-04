@@ -716,7 +716,18 @@ https://segmentfault.com/a/1190000018380327?utm_source=tag-newest
 
 ![在这里插入图片描述](data/1460000018385919.png)
 
-1. 
+<font color=red size=5x>扩容</font>
+
+产生条件
+
+ 	1. 负载因子大于6.5 ----增倍扩容
+ 	2. 溢出桶的数量太多了-----等量扩容
+ 	3. 为什么有等量扩容,对map进行频繁的插入和删除的时候,防止内存溢出
+ 	4. 等量扩容的时候创建一个和原来大小一样的桶用来存储,数据的搬迁是分批次的和redis的渐进式rehash一样
+ 	5. 增倍扩容和等量扩容是一样的,慧创建evaldst的结构体,增倍的时候会初始化两个,老的一个bucket的数据会被分到新的两个桶中,获取hash,然后求出掩码在|操作,等量扩容的时候是初始化一个evaldst结构体,进行每次访问的时候的两个元素的搬迁
+ 	6. 有标识位标识是否子啊进行map扩容,防止重复扩容引起不必要的资源消耗
+
+
 
 ## 设计原理
 
@@ -830,6 +841,7 @@ type hmap struct {
 - `oldbuckets` 是哈希在扩容时用于保存之前 `buckets` 的字段，它的大小是当前 `buckets` 的一半；
 - `noverflow`是溢出的bucket的数量
 - `extra *mapextra`指向溢出桶的地址
+- 设置 flags 标志位，表示有一个 goroutine 正在写入数据。因为 `alg.hash` 有可能出现 `panic` 导致异常
 
 
 
@@ -1036,19 +1048,271 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 
 
 
+
+
 ## 扩容
+
+产生条件
+
+	1. 负载因子大于6.5 ----增倍扩容
+ 	2. 溢出桶的数量太多了-----等量扩容
+ 	3. 为什么有等量扩容,对map进行频繁的插入和删除的时候,防止内存溢出
+ 	4. 等量扩容的时候创建一个和原来大小一样的桶用来存储,数据的搬迁是分批次的和redis的渐进式rehash一样
+ 	5. 增倍扩容和等量扩容是一样的,慧创建evaldst的结构体,增倍的时候会初始化两个,老的一个bucket的数据会被分到新的两个桶中,获取hash,然后求出掩码在|操作,等量扩容的时候是初始化一个evaldst结构体,进行每次访问的时候的两个元素的搬迁
+ 	6. 有标识位标识是否子啊进行map扩容,防止重复扩容引起不必要的资源消耗
+
+
 
 - 当链表越来越长，bucket的扩容次数达到一定值，其实是bmap扩容的加载因数达到6.5，bmap就会进行扩容，将原来bucket数组数量扩充一倍，产生一个新的bucket数组，也就是bmap的buckets属性指向的数组。这样bmap中的oldbuckets属性指向的就是旧bucket数组。
 - 这里的加载因子LoadFactor是一个阈值，计算方式为（map长度/2^B ）如果超过6.5，将会进行扩容，这个是经过测试才得出的合理的一个阈值。因为，加载因子越小，空间利用率就小，加载因子越大，产生冲突的几率就大。所以6.5是一个平衡的值。
 - map的扩容不会立马全部复制，而是渐进式扩容，即首先开辟2倍的内存空间，创建一个新的bucket数组。只有当访问原来就的bucket数组时，才会将就得bucket拷贝到新的bucket数组，进行渐进式的扩容。当然旧的数据不会删除，而是去掉引用，等待gc回收。
 
+我们在介绍哈希的写入过程时省略了扩容操作，随着哈希表中元素的逐渐增加，哈希的性能会逐渐恶化，所以我们需要更多的桶和更大的内存保证哈希的读写性能：
+
+```go
+func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer { 
+	...    
+	if !h.growing() && (overLoadFactor(h.count+1, h.B) || tooManyOverflowBuckets(h.noverflow, h.B)) {   
+  	hashGrow(t, h)        goto again    
+  }    
+  ...
+ }
+```
+
+[`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数会在以下两种情况发生时触发哈希的扩容：
+
+- <font color=red size=5x>装载因子已经超过 6.5；</font>
+- <font color=red size=5x>哈希使用了太多溢出桶；不过由于 Go 语言哈希的扩容不是一个原子的过程，所以 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数还需要判断当前哈希是否已经处于扩容状态，避免二次扩容造成混乱。</font>
 
 
 
+==根据触发的条件不同扩容的方式分成两种，如果这次扩容是溢出的桶太多导致的，那么这次扩容就是等量扩容器==`sameSizeGrow`，`sameSizeGrow` 是一种特殊情况下发生的扩容，<font color=red>当我们持续向哈希中插入数据并将它们全部删除时，如果哈希表中的数据量没有超过阈值，就会不断积累溢出桶造成缓慢的内存泄漏[4](https://www.bookstack.cn/read/draveness-golang/8a6fa5746b8fbe7e.md#fn:4)。</font>[runtime: limit the number of map overflow buckets](https://github.com/golang/go/commit/9980b70cb460f27907a003674ab1b9bea24a847c) 引入了 `sameSizeGrow` 通过重用已有的哈希扩容机制，一旦哈希中出现了过多的溢出桶，它就会创建新桶保存数据，垃圾回收会清理老的溢出桶并释放内存[5](https://www.bookstack.cn/read/draveness-golang/8a6fa5746b8fbe7e.md#fn:5)。
 
+扩容的入口是 [`runtime.hashGrow`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1017-L1058) 函数：
 
+```go
+func hashGrow(t *maptype, h *hmap) {    
+	bigger := uint8(1)    
+	if !overLoadFactor(h.count+1, h.B) {
+  	bigger = 0        
+  	h.flags |= sameSizeGrow   
+  }    
+  
+  oldbuckets := h.buckets    
+  newbuckets, nextOverflow := makeBucketArray(t, h.B+bigger, nil)   
+  h.B += bigger   
+  h.flags = flags    
+  h.oldbuckets = oldbuckets    
+  h.buckets = newbuckets    
+  h.nevacuate = 0    
+  h.noverflow = 0    
+  h.extra.oldoverflow = h.extra.overflow    
+  h.extra.overflow = nil    
+  h.extra.nextOverflow = nextOverflow
+ }
+```
 
+哈希在扩容的过程中会通过 [`runtime.makeBucketArray`](https://github.com/golang/go/blob/dcd3b2c173b77d93be1c391e3b5f932e0779fb1f/src/runtime/map.go#L344-L387) 创建一组新桶和预创建的溢出桶，随后将原有的桶数组设置到 `oldbuckets` 上并将新的空桶设置到 `buckets` 上，溢出桶也使用了相同的逻辑进行更新，下图展示了触发扩容后的哈希：
 
+![hashtable-hashgrow](data.assets/c2ef289220a77616e5399feffea2a3a7.png)
+
+**图 3-15 哈希表触发扩容**
+
+我们在 [`runtime.hashGrow`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1017-L1058) 中还看不出来等量扩容和正常扩容的太多区别，<font color=red size=5x>等量扩容创建的新桶数量只是和旧桶一样，该函数中只是创建了新的桶，并没有对数据进行拷贝和转移，哈希表的数据迁移的过程在是 [`runtime.evacuate`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1128-L1240) 函数中完成的，它会对传入桶中的元素进行『再分配』。</font>
+
+```go
+func evacuate(t *maptype, h *hmap, oldbucket uintptr) {   
+	b := (*bmap)(add(h.oldbuckets, oldbucket*uintptr(t.bucketsize)))    
+	newbit := h.noldbuckets()    
+	if !evacuated(b) {        
+		var xy [2]evacDst        
+		x := &xy[0]        
+		x.b = (*bmap)(add(h.buckets, oldbucket*uintptr(t.bucketsize)))        
+		x.k = add(unsafe.Pointer(x.b), dataOffset)        
+		x.v = add(x.k, bucketCnt*uintptr(t.keysize))        
+		y := &xy[1]        
+		y.b = (*bmap)(add(h.buckets, (oldbucket+newbit)*uintptr(t.bucketsize)))        
+		y.k = add(unsafe.Pointer(y.b), dataOffset)        
+		y.v = add(y.k, bucketCnt*uintptr(t.keysize))
+```
+
+[`runtime.evacuate`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1128-L1240) 函数会将一个旧桶中的数据分流到两个新桶，所以它会创建两个用于保存分配上下文的 `evacDst` 结构体，这两个结构体分别指向了一个新桶：
+
+![hashtable-evacuate-destination](data.assets/03db974ea7773f786f1f6cebf7f117a6.png)
+
+**图 3-16 哈希表扩容目的**
+
+如果这是一等量扩容，旧桶与新桶之间是一对一的关系，所以两个 `evacDst` 结构体只会初始化一个，当哈希表的容量翻倍时，每个旧桶的元素会都被分流到新创建的两个桶中，我们仔细分析一下分流元素的逻辑：
+
+```go
+        for ; b != nil; b = b.overflow(t) {    
+        	k := add(unsafe.Pointer(b), dataOffset)            
+        	v := add(k, bucketCnt*uintptr(t.keysize))            
+        	for i := 0; i < bucketCnt; i, k, v = i+1, add(k, uintptr(t.keysize)), add(v, uintptr(t.valuesize)) {                
+        		top := b.tophash[i]                
+        		k2 := k                
+        		var useY uint8                
+        		hash := t.key.alg.hash(k2, uintptr(h.hash0))         
+            if hash&newbit != 0 {                   
+            	useY = 1                
+            }                
+            b.tophash[i] = evacuatedX + useY              
+            dst := &xy[useY]                
+            if dst.i == bucketCnt {                 
+              dst.b = h.newoverflow(t, dst.b)             
+              dst.i = 0                    
+              dst.k = add(unsafe.Pointer(dst.b), dataOffset)    
+              dst.v = add(dst.k, bucketCnt*uintptr(t.keysize))       
+            }               
+            dst.b.tophash[dst.i&(bucketCnt-1)] = top 
+            typedmemmove(t.key, dst.k, k)                
+            typedmemmove(t.elem, dst.v, v)                
+            dst.i++                
+            dst.k = add(dst.k, uintptr(t.keysize))                
+            dst.v = add(dst.v, uintptr(t.valuesize))            
+            }        
+           }        
+           ...
+          }
+```
+
+只使用哈希函数是不能定位到具体某一个桶的，哈希函数只会返回很长的哈希，例如：`b72bfae3f3285244c4732ce457cca823bc189e0b`，我们还需一些方法将哈希映射到具体的桶上，在很多时候我们都会使用取模或者位操作来获取桶的编号，假如当前哈希中包含 4 个桶，那么它的桶掩码就是 `0b11(3)`，使用位操作就会得到 3，我们就会在 3 号桶中存储该数据：
+
+```
+0xb72bfae3f3285244c4732ce457cca823bc189e0b & 0b11 #=> 0
+```
+
+如果新的哈希表有 8 个桶，在大多数情况下，原来经过桶掩码 `0b11` 结果为 3 的数据会因为桶掩码增加了一位编程 `0b111` 而分流到新的 3 号和 7 号桶，所有数据也都会被 `typedmemmove` 拷贝到目标桶中：
+
+![hashtable-bucket-evacuate](data.assets/182c07d1f14ecee8292110bc1c52317c.png)
+
+**图 3-17 哈希表桶数据的分流**
+
+[`runtime.evacuate`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1128-L1240) 最后会调用 [`runtime.advanceEvacuationMark`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1242-L1264) 增加哈希的 `nevacuate` 计数器，在所有的旧桶都被分流后清空哈希的 `oldbuckets` 和 `oldoverflow` 字段：
+
+```go
+func advanceEvacuationMark(h *hmap, t *maptype, newbit uintptr) { 
+	h.nevacuate++   
+  stop := h.nevacuate + 1024    
+  if stop > newbit {        
+  	stop = newbit    
+  }    
+  for h.nevacuate != stop && bucketEvacuated(t, h, h.nevacuate) {        
+  	h.nevacuate++   
+   }    
+   if h.nevacuate == newbit { // newbit == # of oldbuckets      
+   	h.oldbuckets = nil        
+   	if h.extra != nil {            
+   		h.extra.oldoverflow = nil       
+    }        
+    h.flags &^= sameSizeGrow    
+    }
+ }
+```
+
+之前在分析哈希表访问函数 [`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450) 时其实省略了扩容期间获取键值对的逻辑，当哈希表的 `oldbuckets` 存在时，就会先定位到旧桶并在该桶没有被分流时从中获取键值对。
+
+```go
+func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {    
+	...    
+	alg := t.key.alg    
+	hash := alg.hash(key, uintptr(h.hash0))   
+  m := bucketMask(h.B)    
+  b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))    
+  if c := h.oldbuckets; c != nil {        
+  	if !h.sameSizeGrow() {           
+    	m >>= 1        
+    }        
+    oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))        
+    if !evacuated(oldb) {            
+    	b = oldb        
+    }    
+   }
+   bucketloop:    
+   ...
+  }
+```
+
+因为就桶中还没有被 [`runtime.evacuate`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1128-L1240) 函数分流，其中还保存着我们需要使用的数据，会替代新创建的空桶提供数据。
+
+我们在 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数中也省略了一段逻辑，当哈希表正在处于扩容状态时，每次向哈希表写入值时都会触发 [`runtime.growWork`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1104-L1113) 对哈希表的内容进行增量拷贝：
+
+```go
+func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {    
+	...again:    
+	bucket := hash & bucketMask(h.B)    
+	if h.growing() {   
+  	growWork(t, h, bucket)    
+  }    
+  ...
+}
+```
+
+当然除了写入操作之外，删除操作也会在哈希表扩容期间触发 [`runtime.growWork`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1104-L1113)，触发的方式和代码与这里的逻辑几乎完全相同，都是计算当前值所在的桶，然后对该桶中的元素进行拷贝。
+
+我们简单总结一下哈希表的扩容设计和原理，哈希在存储元素过多时会触发扩容操作，每次都会将桶的数量翻倍，整个扩容过程并不是原子的，而是通过 [`runtime.growWork`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L1104-L1113) 增量触发的，在扩容期间访问哈希表时会使用旧桶，向哈希表写入数据时会触发旧桶元素的分流；除了这种正常的扩容之外，为了解决大量写入、删除造成的内存泄漏问题，哈希引入了 `sameSizeGrow` 这一机制，在出现较多溢出桶时会对哈希进行『内存整理』减少对空间的占用。
+
+## 删除
+
+如果想要删除哈希中的元素，就需要使用 Go 语言中的 `delete` 关键字，这个关键的唯一作用就是将某一个键对应的元素从哈希表中删除，无论是该键对应的值是否存在，这个内建的函数都不会返回任何的结果。
+
+![hashtable-delete](data.assets/8472ea48f093010e0d54989cbe0fc489.png)
+
+**图 3-18 哈希表删除操作**
+
+在编译期间，`delete` 关键字会被转换成操作为 `ODELETE` 的节点，而 `ODELETE` 会被 [cmd/compile/internal/gc.walkexpr](https://github.com/golang/go/blob/4d5bb9c60905b162da8b767a8a133f6b4edcaa65/src/cmd/compile/internal/gc/walk.go#L439-L1532) 转换成 `mapdelete` 函数簇中的一个，包括 `mapdelete`、`mapdelete_faststr`、`mapdelete_fast32` 和 `mapdelete_fast64`：
+
+```go
+func walkexpr(n *Node, init *Nodes) *Node {    
+  	switch n.Op {    
+      case ODELETE:        
+      	init.AppendNodes(&n.Ninit)        
+      	map_ := n.List.First()        
+      	key := n.List.Second()        
+      	map_ = walkexpr(map_, init)        
+      	key = walkexpr(key, init)        
+      	t := map_.Type        
+      	fast := mapfast(t)        
+      if fast == mapslow {            	
+        	key = nod(OADDR, key, nil)        
+      }       
+      n = mkcall1(mapfndel(mapdelete[fast], t), nil, init, typename(t), map_, key)    
+    }
+}
+```
+
+这些函数的实现其实差不多，我们来分析其中的 [`runtime.mapdelete`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L685-L791) 函数，哈希表的删除逻辑与写入逻辑非常相似，只是触发哈希的删除需要使用关键字，如果在删除期间遇到了哈希表的扩容，就会对即将操作的桶进行分流，分流结束之后会找到桶中的目标元素完成键值对的删除工作。
+
+```go
+func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {    
+	...    
+	if h.growing() {        
+		growWork(t, h, bucket)    
+	}    
+	...search: 
+  for ; b != nil; b = b.overflow(t) {     
+   for i := uintptr(0); i < bucketCnt; i++ { 
+   	if b.tophash[i] != top {        
+    	if b.tophash[i] == emptyRest {   
+      	break search             
+      }               
+      continue           
+		 }            
+		 k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))          
+     k2 := k            
+     if !alg.equal(key, k2) {         
+     	continue            
+     }           
+     *(*unsafe.Pointer)(k) = nil    
+     v := add(unsafe.Pointer(b), 		dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))            *(*unsafe.Pointer)(v) = nil            
+     b.tophash[i] = emptyOne            
+     ...       
+     }   
+    }
+  }
+```
+
+我们其实只需要知道 `delete` 关键字在编译期间经过[类型检查](https://www.bookstack.cn/read/draveness-golang/7ab240185c175c73.md)和[中间代码生成](https://www.bookstack.cn/read/draveness-golang/5a89e04c79706261.md)阶段被转换成 [`runtime.mapdelete`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L685-L791) 函数簇中的一员就可以，用于处理删除逻辑的函数与哈希表的 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 几乎完全相同，不太需要刻意关注。
 
 
 
