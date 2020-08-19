@@ -1034,13 +1034,210 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 
 ## 读写操作
 
+哈希表作为一种数据结构，我们肯定需要分析它的常见操作，首先就需要了解其读写操作的实现原理，访问哈希表一般都是通过下标或者遍历两种方式进行的：
 
+```
+_ = hash[key]
+for k, v := range hash {   
+	// k, v
+}
+```
+
+这两种方式虽然都能读取哈希表中的数据，但是使用的函数和底层的原理完全不同，前者需要知道哈希的键并且一次只能获取单个键对应的值，而后者可以遍历哈希中的全部键值对，访问数据时也不需要预先知道哈希的键，在这里我们会介绍前一种访问方式，第二种访问方式会在 `range` 一节中详细分析。
+
+数据结构的写一般指的都是增加、删除和修改，增加和修改字段都使用索引和赋值语句，而删除字典中的数据需要使用关键字 `delete`：
+
+```go
+hash[key] = value
+hash[key] = newValue
+delete(hash, key)
+```
+
+除了这些操作之外，我们还会分析哈希的扩容过程，这能帮助我们深入理解哈希是如何对数据进行存储的。
+
+### 访问
+
+在编译的[类型检查](https://www.bookstack.cn/read/draveness-golang/7ab240185c175c73.md)期间，`hash[key]` 以及类似的操作都会被转换成对哈希的 [`OINDEXMAP`](https://github.com/golang/go/blob/4d5bb9c60905b162da8b767a8a133f6b4edcaa65/src/cmd/compile/internal/gc/walk.go#L1089) 操作，[中间代码生成](https://www.bookstack.cn/read/draveness-golang/5a89e04c79706261.md)阶段会在 [`cmd/compile/internal/gc.walkexpr`](https://github.com/golang/go/blob/4d5bb9c60905b162da8b767a8a133f6b4edcaa65/src/cmd/compile/internal/gc/walk.go#L439-L1532) 函数中将这些 [`OINDEXMAP`](https://github.com/golang/go/blob/4d5bb9c60905b162da8b767a8a133f6b4edcaa65/src/cmd/compile/internal/gc/walk.go#L1089) 操作转换成如下的代码：
+
+```go
+v     := hash[key] // => v     := *mapaccess1(maptype, hash, &key)
+v, ok := hash[key] // => v, ok := mapaccess2(maptype, hash, &key)
+```
+
+赋值语句左侧接受参数的个数会决定使用的运行时方法：
+
+- 当接受参数仅为一个时，会使用 [`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450)，该函数仅会返回一个指向目标值的指针；
+- 当接受两个参数时，会使用 [`runtime.mapaccess2`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L452-L508)，除了返回目标值之外，它还会返回一个用于表示当前键对应的值是否存在的布尔值：[`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450) 函数会先通过哈希表设置的哈希函数、种子获取当前键对应的哈希，再通过 `bucketMask` 和 `add` 函数拿到该键值对所在的桶序号和哈希最上面的 8 位数字。
+
+```go
+func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer { 
+	alg := t.key.alg   
+  hash := alg.hash(key, uintptr(h.hash0))    
+  m := bucketMask(h.B)    
+  b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))   
+  top := tophash(hash)bucketloop:    
+  for ; b != nil; b = b.overflow(t) {        
+  	for i := uintptr(0); i < bucketCnt; i++ {            
+  		if b.tophash[i] != top {                
+        if b.tophash[i] == emptyRest {                   
+          break bucketloop               
+        }                
+        continue
+       }            
+       
+       k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+       if alg.equal(key, k) {                
+       		v := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))                					return v           
+       }        
+ 	 }     
+ }    
+  return unsafe.Pointer(&zeroVal[0])
+}
+```
+
+<font color=red size=4x>在 `bucketloop` 循环中，哈希会依次遍历正常桶和溢出桶中的数据，它会比较这 8 位数字和桶中存储的 `tophash`，每一个桶都存储键对应的 `tophash`，每一次读写操作都会与桶中所有的 `tophash` 进行比较，==用于选择桶序号的是哈希的最低几位==，而用于加速访问的是哈希的高 8 位，这种设计能够减少同一个桶中有大量相等 `tophash` 的概率。</font>
+
+![hashtable-mapaccess](data/398d3189d87a332a6f8d117aa79db5c4.png)
+
+**图 3-13 访问哈希表中的数据**
+
+如上图所示，==每一个桶都是一整片的内存空间==，<font color=green>当发现桶中的 `tophash` 与传入键的 `tophash` 匹配之后，我们会通过指针和偏移量获取哈希中存储的键 `keys[0]` 并与 `key` 比较，如果两者相同就会获取目标值的指针 `values[0]` 并返回。</font>
+
+另一个同样用于访问哈希表中数据的 [`runtime.mapaccess2`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L452-L508) 只是在 [`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450) 的基础上多返回了一个标识键值对是否存在的布尔值：
+
+```go
+func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) {   
+	...bucketloop:    
+	for ; b != nil; b = b.overflow(t) {        
+		for i := uintptr(0); i < bucketCnt; i++ {            
+			if b.tophash[i] != top {                
+        if b.tophash[i] == emptyRest {                    
+          break bucketloop               
+        }                
+        continue           
+      }            
+       k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))            
+       if alg.equal(key, k) {                
+       	v := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))                						return v, true            
+       }       
+    }    
+ }    
+ return unsafe.Pointer(&zeroVal[0]), false
+}
+```
+
+使用 `v, ok := hash[k]` 的形式访问哈希表中元素时，我们能够通过这个布尔值更准确地知道当 `v == nil` 时，`v` 到底是哈希中存储的元素还是表示该键对应的元素不存在，所以在访问哈希时，更推荐使用这一种方式先判断元素是否存在。
+
+上面的过程其实是在正常情况下，访问哈希表中元素时的表现，然而与数组一样，哈希表可能会在装载因子过高或者溢出桶过多时进行扩容，哈希表的扩容并不是一个原子的过程，在扩容的过程中保证哈希的访问是比较有意思的话题，我们在这里其实也省略了相关的代码，不过会在下面展开介绍。
+
+### 写入
+
+当形如 `hash[k]` 的表达式出现在赋值符号左侧时，该表达式也会在编译期间转换成调用 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数，该函数与 [`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450) 比较相似，我们将该其分成几个部分分析，首先是函数会根据传入的键拿到对应的哈希和桶：
+
+```go
+func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {    
+	alg := t.key.alg    
+	hash := alg.hash(key, uintptr(h.hash0))    
+	h.flags ^= hashWritingagain:    
+	bucket := hash & bucketMask(h.B)    
+	b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) + bucket*uintptr(t.bucketsize)))    
+	top := tophash(hash)
+```
+
+<font color=red>然后通过遍历比较桶中存储的 `tophash` 和键的哈希，如果找到了相同结果就会获取目标位置的地址并返回，其中 `inserti` 表示目标元素的在桶中的索引，`insertk` 和 `val` 分别表示键值对的地址，获得目标地址之后会直接通过算术计算进行寻址获得键值对 `k` 和 `val`：</font>
+
+```go
+    var inserti *uint8    
+    var insertk unsafe.Pointer    
+    var val unsafe.Pointerbucketloop:    
+    for {        
+    	for i := uintptr(0); i < bucketCnt; i++ { 
+      	if b.tophash[i] != top {               
+            if isEmpty(b.tophash[i]) && inserti == nil {       
+              inserti = &b.tophash[i]                    
+              insertk = add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))                   
+              val = add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))                						}         
+          	if b.tophash[i] == emptyRest {   
+          		break bucketloop       
+            }                
+            continue           
+        }            
+        k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))            
+        if !alg.equal(key, k) {               
+        	continue            
+        }            
+        val = add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))            					goto done       
+        }        
+        
+        ovf := b.overflow(t)       
+        if ovf == nil {            
+        	break        
+        }       
+          
+        b = ovf   
+   }
+```
+
+在上述的 for 循环中会依次遍历正常桶和溢出桶中存储的数据，整个过程会依次判断 `tophash` 是否相等、`key` 是否相等，遍历结束后会从循环中跳出。
+
+![hashtable-overflow-bucket](https://static.bookstack.cn/projects/draveness-golang/b9a4c6b42f48ee8dc41ba280ba6fc176.png)
+
+**图 3-15 哈希遍历溢出桶**
+
+如果当前桶已经满了，哈希会调用 `newoverflow` 函数创建新桶或者使用 `hmap` 预先在 `noverflow` 中创建好的桶来保存数据，新创建的桶不仅会被追加到已有桶的末尾，还会增加哈希表的 `noverflow` 计数器。
+
+```go
+    if inserti == nil {        
+    	newb := h.newoverflow(t, b)       
+      inserti = &newb.tophash[0]        
+      insertk = add(unsafe.Pointer(newb), dataOffset)        
+      val = add(insertk, bucketCnt*uintptr(t.keysize))    
+    }    
+    
+    typedmemmove(t.key, insertk, key)    
+    *inserti = top    
+    h.count++done:    
+    return val
+ }
+```
+
+如果当前键值对在哈希中不存在，哈希为新键值对规划存储的内存地址，通过 `typedmemmove` 将键移动到对应的内存空间中并返回键对应值的地址 `val`，如果当前键值对在哈希中存在，那么就会直接返回目标区域的内存地址。哈希并不会在 `mapassign` 这个运行时函数中将值拷贝到桶中，该函数只会返回内存地址，真正的赋值操作是在编译期间插入的：
+
+```go
+00018 (+5) CALL runtime.mapassign_fast64(SB)
+00020 (5) MOVQ 24(SP), DI               ;; DI = &value
+00026 (5) LEAQ go.string."88"(SB), AX   ;; AX = &"88"
+00027 (5) MOVQ AX, (DI)                 ;; *DI = AX
+```
+
+[`runtime.mapassign_fast64`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map_fast64.go#L92-L180) 与 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数的实现差不多，我们需要关注的是后面的三行代码，`24(SP)` 就是该函数返回的值地址，我们通过 `LEAQ` 指令将字符串的地址存储到寄存器 `AX` 中，`MOVQ` 指令将字符串 `"88"` 存储到了目标地址上完成了这次哈希的写入。
 
 ## 扩容
 
-- 当链表越来越长，bucket的扩容次数达到一定值，其实是bmap扩容的加载因数达到6.5，bmap就会进行扩容，将原来bucket数组数量扩充一倍，产生一个新的bucket数组，也就是bmap的buckets属性指向的数组。这样bmap中的oldbuckets属性指向的就是旧bucket数组。
+- 当链表越来越长，bucket的扩容次数达到一定值，<font color=red size=5x>其实是bmap扩容的加载因数达到6.5，bmap就会进行扩容，将原来bucket数组数量扩充一倍，产生一个新的bucket数组，也就是bmap的buckets属性指向的数组。这样bmap中的oldbuckets属性指向的就是旧bucket数组。</font>
 - 这里的加载因子LoadFactor是一个阈值，计算方式为（map长度/2^B ）如果超过6.5，将会进行扩容，这个是经过测试才得出的合理的一个阈值。因为，加载因子越小，空间利用率就小，加载因子越大，产生冲突的几率就大。所以6.5是一个平衡的值。
-- map的扩容不会立马全部复制，而是渐进式扩容，即首先开辟2倍的内存空间，创建一个新的bucket数组。只有当访问原来就的bucket数组时，才会将就得bucket拷贝到新的bucket数组，进行渐进式的扩容。当然旧的数据不会删除，而是去掉引用，等待gc回收。
+- map的扩容不会立马全部复制，==而是渐进式扩容==，即首先开辟2倍的内存空间，创建一个新的bucket数组。只有当访问原来就的bucket数组时，才会将就得bucket拷贝到新的bucket数组，进行渐进式的扩容。==当然旧的数据不会删除，而是去掉引用，等待gc回收。==
+
+
+
+我们在介绍哈希的写入过程时省略了扩容操作，随着哈希表中元素的逐渐增加，哈希的性能会逐渐恶化，所以我们需要更多的桶和更大的内存保证哈希的读写性能：
+
+```go
+func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {  
+	...    
+	if !h.growing() && (overLoadFactor(h.count+1, h.B) || tooManyOverflowBuckets(h.noverflow, h.B)) {        			hashGrow(t, h)        
+		goto again    
+	}    
+	...
+}
+```
+
+[`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数会在以下两种情况发生时触发哈希的扩容：
+
+- <font color=red size=5x>装载因子已经超过 6.5；</font>
+- <font color=red size=5x>哈希使用了太多溢出桶；不过由于 Go 语言哈希的扩容不是一个原子的过程，所以 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数还需要判断当前哈希是否已经处于扩容状态，避免二次扩容造成混乱。</font>
+
+==根据触发的条件不同扩容的方式分成两种，如果这次扩容是溢出的桶太多导致的，那么这次扩容就是等量扩容 ====`sameSizeGrow`，`sameSizeGrow` 是一种特殊情况下发生的扩容，当我们持续向哈希中插入数据并将它们全部删除时，如果哈希表中的数据量没有超过阈值，就会不断积累溢出桶造成缓慢的内存泄漏[4](https://www.bookstack.cn/read/draveness-golang/8a6fa5746b8fbe7e.md#fn:4)。[runtime: limit the number of map overflow buckets](https://github.com/golang/go/commit/9980b70cb460f27907a003674ab1b9bea24a847c) 引入了 `sameSizeGrow` 通过重用已有的哈希扩容机制，一旦哈希中出现了过多的溢出桶，它就会创建新桶保存数据，垃圾回收会清理老的溢出桶并释放内存[5](https://www.bookstack.cn/read/draveness-golang/8a6fa5746b8fbe7e.md#fn:5)。
 
 
 
