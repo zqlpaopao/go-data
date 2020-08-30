@@ -1516,33 +1516,315 @@ func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 
 
 
+# ==-------------关键字----------==
+
+# select
+
+很多 C 语言或者 Unix 开发者听到 `select` 想到的都是系统调用，而谈到 I/O 模型时最终大都会提到基于 `select`、`poll` 和 `epoll` 等函数构建的 IO 多路复用模型。Go 语言的 `select` 与 C 语言中的 `select` 有着比较相似的功能。
+
+C 语言中的 `select` 关键字可以同时监听多个文件描述符的可读或者可写的状态，Go 语言中的 `select` 关键字也能够让 Goroutine 同时等待多个 Channel 的可读或者可写，在多个文件或者 Channel 发生状态改变之前，`select` 会一直阻塞当前线程或者 Goroutine。
+
+![Golang-Select-Channels](data/d5f86fa94ffc8ee348eda427e3344f84.png)
+
+```go
+func fibonacci(c, quit chan int) {
+	x, y := 0, 1
+	for {
+		select {
+		case c <- x:
+			x, y = y, x+y
+		case <-quit:
+			fmt.Println("quit")
+			return
+		}
+	}
+}
+```
+
+上述控制结构会等待 `c <- x` 或者 `<-quit` 两个表达式中任意一个的返回。无论哪一个表达式返回都会立刻执行 `case` 中的代码，当 `select` 中的两个 `case` 同时被触发时，就会随机选择一个 `case` 执行。
+
+## 现象
+
+当我们在 Go 语言中使用 `select` 控制结构时，会遇到两个有趣的现象：
+
+- ==`select` 能在 Channel 上进行非阻塞的收发操作；==
+- ==`select` 在遇到多个 Channel 同时响应时会随机挑选 `case` 执行；这两个现象是学习 `select` 时经常会遇到的，我们来深入了解具体的场景并分析这两个现象背后的设计原理。==
 
 
 
+## 非阻塞的收发
+
+在通常情况下，`select` 语句会阻塞当前 Goroutine 并等待多个 Channel 中的一个达到可以收发的状态。但是如果 `select` 控制结构中包含 `default` 语句，那么这个 `select` 语句在执行时会遇到以下两种情况：
+
+- <font color=red size=5x>当存在可以收发的 Channel 时，直接处理该 Channel 对应的 `case`；</font>
+- <font color= red size=5x>当不存在可以收发的 Channel 是，执行 `default` 中的语句；当我们运行下面的代码时就不会阻塞当前的 Goroutine，它会直接执行 `default` 中的代码并返回。</font>
+
+```go
+func main() {
+	ch := make(chan int)
+	select {
+	case i := <-ch:
+		println(i)
+	default:
+		println("default")
+	}
+}
+```
+
+```go
+default
+```
+
+`select` 的作用就是同时监听多个 `case` 是否可以执行，如果多个 Channel 都不能执行，那么运行 `default` 中的代码也是理所当然的。
+
+非阻塞的 Channel 发送和接收操作还是很有必要的，在很多场景下我们不希望向 Channel 发送消息或者从 Channel 中接收消息会阻塞当前 Goroutine，我们只是向看看 Channel 的可读或者可写状态。下面就是一个常见的例子：
+
+```
+errCh := make(chan error, len(tasks)
+	wg := sync.WaitGroup{}
+	wg.Add(len(tasks))
+	for i := range tasks {
+		go func() {
+			defer wg.Done()
+			if err := tasks[i].Run(); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+```
+
+在上面这段代码中，我们不关心到底多少个任务执行失败了，只关心是否存在返回错误的任务，最后的 `select` 语句就能很好地完成这个任务。
 
 
 
+## 随机执行
+
+另一个使用 `select` 遇到的情况是同时有多个 `case` 就绪时，`select` 会选择那个 `case` 执行的问题，我们通过下面的代码可以简单了解一下：
+
+```go
+package main
+
+import "time"
+
+func main() {
+	ch := make(chan int)
+	go func() {
+		for range time.Tick(1 * time.Second) {
+			ch <- 0
+		}
+	}()
+	for {
+		select {
+		case c := <-ch:
+			println("case1")
+			println(c)
+		case <-ch:
+			println("case2")
+		}
+	}
+}
+
+```
 
 
 
+从上述代码输出的结果中我们可以看到，`select` 在遇到多个 `<-ch` 同时满足可读或者可写条件时会随机选择一个 `case` 执行其中的代码。
+
+这个设计是在十多年前被 [select](https://github.com/golang/go/commit/cb9b1038db77198c2b0961634cf161258af2374d) 提交[5](https://www.bookstack.cn/read/draveness-golang/1a4f7a284cd2b279.md#fn:5)引入并一直保留到现在的，虽然中间经历过一些修改[6](https://www.bookstack.cn/read/draveness-golang/1a4f7a284cd2b279.md#fn:6)，但是语义一直都没有改变。在上面的代码中，两个 `case` 都是同时满足执行条件的，<font color=red>如果我们按照顺序依次判断，那么后面的条件永远都会得不到执行，而随机的引入就是为了避免饥饿问题的发生。</font>
+
+## 数据结构
+
+`select` 在 Go 语言的源代码中不存在对应的结构体，但是 `select` 控制结构中的 `case` 却使用 [`runtime.scase`](https://github.com/golang/go/blob/d1969015b4ac29be4f518b94817d3f525380639d/src/runtime/select.go#L28-L34) 结构体来表示：
+
+```
+type scase struct {    
+	c           *hchan   
+  elem        unsafe.Pointer
+  kind        uint16    
+  pc          uintptr    
+  releasetime int64
+ }
+```
+
+因为非默认的 `case` 中都与 Channel 的发送和接收有关，所以 [`runtime.scase`](https://github.com/golang/go/blob/d1969015b4ac29be4f518b94817d3f525380639d/src/runtime/select.go#L28-L34) 结构体中也包含一个 [`runtime.hchan`](https://github.com/golang/go/blob/d1969015b4ac29be4f518b94817d3f525380639d/src/runtime/chan.go#L32-L51) 类型的字段存储 `case` 中使用的 Channel；除此之外，`elem` 是接收或者发送数据的变量地址、`kind` 表示 [`runtime.scase`](https://github.com/golang/go/blob/d1969015b4ac29be4f518b94817d3f525380639d/src/runtime/select.go#L28-L34) 的种类，总共包含以下四种：
+
+```go
+const (    
+	caseNil = iota
+  caseRecv    
+  caseSend    
+  caseDefault
+)
+```
+
+这四种常量分别表示不同类型的 `case`，相信它们的命名已经能够充分帮助我们理解它们的作用了，所以这里也不一一介绍了。
+
+## 实现原理
+
+# defer
+
+链表，每次有一个新的defer的时候回追加到最新的defer链表处
+
+作为一个编程语言中的关键字，`defer` 的实现一定是由编译器和运行时共同完成的
+
+```go
+func createPost(db *gorm.DB) error {
+	tx := db.Begin()
+	defer tx.Rollback()
+	if err := tx.Create(&Post{Author: "Draveness"}).Error; err != nil {
+		return err
+	}
+	return tx.Commit().Error
+}
+```
+
+在使用数据库事务时，我们可以使用如上所示的代码在创建事务之后就立刻调用 `Rollback` 保证事务一定会回滚。哪怕事务真的执行成功了，那么调用 `tx.Commit()` 之后再执行 `tx.Rollback()` 也不会影响已经提交的事务。
+
+现象
+
+## 数据结构
+
+在介绍 `defer` 函数的执行过程与实现原理之前，我们首先来了解一下 `defer` 关键字在 Go 语言源代码中对应的数据结构：
+
+```go
+type _defer struct {    
+	siz     int32    
+	started bool    
+	sp      uintptr   
+  pc      uintptr    
+  fn      *funcval   
+  _panic  *_panic    
+  link    *_defer
+}
+```
+
+[`runtime._defer`](https://github.com/golang/go/blob/cfe3cd903f018dec3cb5997d53b1744df4e53909/src/runtime/runtime2.go#L853-L878) 结构体是延迟调用链表上的一个元素，所有的结构体都会通过 `link` 字段串联成链表。
+
+![golang-defer-link](data/9aec08defae33c08897ca9b3a4f4c0d3.png)
+
+**图 5-10 延迟调用链表**
+
+我们简单介绍一下 [`runtime._defer`](https://github.com/golang/go/blob/cfe3cd903f018dec3cb5997d53b1744df4e53909/src/runtime/runtime2.go#L853-L878) 结构体中的几个字段：
+
+- `siz` 是参数和结果的内存大小；
+- `sp` 和 `pc` 分别代表栈指针和调用方的程序计数器；
+- `fn` 是 `defer` 关键字中传入的函数；
+- `_panic` 是触发延迟调用的结构体，可能为空；
+
+除了上述的这些字段之外，[`runtime._defer`](https://github.com/golang/go/blob/cfe3cd903f018dec3cb5997d53b1744df4e53909/src/runtime/runtime2.go#L853-L878) 中还包含一些垃圾回收机制使用的字段，这里为了减少理解的成本就都省去了。
+
+## 1.12 defer 流程
+
+1. ==先注册，后调用==
+
+2. deferproc进行注册 deferreturn 是调用
+
+3. 会预先分配deferpool，没有在进行分配
+
+4. 注册的时候会将局部变量从栈拷贝到堆上进行预分配空间，返回值在从堆上在拷贝回栈上，如果变量不是传入的外部变量，会进行取&操作，没有捕获列表
+
+5. <font color=red size=5x>捕获列表指的是，在defer的闭包函数内有引用的可能会在后续改变的参数，就会有捕获列表</font>，堆上存的是地址
+
+6. 闭包函数函数通过寄存器的funavalue 和偏移量获取参数列表
+
+7. 每个defer都会创建一个defer结构体
+
+   ```
+   type _defer struct {    
+   	siz     int32    //参数和返回值
+   	started bool    //是否执行
+   	sp      uintptr   //调用者栈指针
+     pc      uintptr    //返回地址
+     fn      *funcval   //注册的函数
+     _panic  *_panic    
+     link    *_defer//next _defer
+   }
+   ```
+
+8. <font color=red size=5x>go 1.12 defer 慢的原因</font>
+
+   1. defer 在堆上分配，注册的时候从栈上拷贝到堆上，返回的时候从堆上拷贝到栈上
+
+   2. _defer 是连表操作，连表本身比较慢
+
+      ![image-20200830210643237](data/image-20200830210643237.png)
 
 
 
+![image-20200830204925943](data/image-20200830204925943.png)
+
+![image-20200830205005933](data/image-20200830205005933.png) 
+
+![image-20200830205027667](data/image-20200830205027667.png)
+
+![image-20200830205247273](data/image-20200830205247273.png)
+
+![image-20200830205416370](data/image-20200830205416370.png)
 
 
 
+ 捕获列表
+
+![image-20200830210021829](data/image-20200830210021829.png)
+
+## go 1.13 1.14的defer优化
+
+1. <font color=red size=5x>正常的defer优化是 将堆分配改为存储在栈的局部变量中，减少堆分配的消耗</font>
+2. <font color=red size=5x>嵌套或者循环defer 增加了heap 来区分失去需要堆分配</font>
+3. <font color=red size=5x>隐式或者嵌套的defer不是和1.12一样，是从局部变量拷贝到栈的参数列表中</font>,1.13 号称提高30%
+4. <font color=red size=5x>1.14 中是将defer 预先和代码函数整合，在return之前调用defer函数</font>
+5. <font color=red size=5x>1.14中，如果在defer钱出现了panic的话就会通过==栈扫描==来顺序执行defer（因为没有了注册defer的连表了)，==此时panic就会变得很慢,panic的记录比defer低很多==</font>
+
+![image-20200830211302539](data/image-20200830211302539.png)
 
 
 
+嵌套或者隐士
+
+![image-20200830211639632](data/image-20200830211639632.png)
+
+![image-20200830211709315](data/image-20200830211709315.png)
 
 
 
+## 1.14
+
+![image-20200830212202541](data/image-20200830212202541.png)
+
+ ![image-20200830212344946](data/image-20200830212344946.png)
 
 
 
+# panic rever
+
+1. 执行的goruntine除了支持defer的链表头信息<font color=red size=5x>,也会持有panic的连表头指针信息</font>
+2. <font color=red size=5x>panic 和defer的执行顺序，发生panic的时候，不会执行下面的代码，会出发defer==会优先将defer结构体中的是否执行标志改为true，防止defer中panic发生，而执行不了==</font>
+3. <font color=red size=5x>panic 打印错错误信息，会先打印开始的信息</font>
+4. recover 只是将panic的recoverd置为true
+5. 
+
+![image-20200830212711018](data/image-20200830212711018.png)
 
 
 
+2. 
+
+![image-20200830213325944](data/image-20200830213325944.png)
+
+
+
+![image-20200830213555972](data/image-20200830213555972.png)
+
+![image-20200830213654114](data/image-20200830213654114.png)
+
+![image-20200830214216747](data/image-20200830214216747.png)
 
 
 
