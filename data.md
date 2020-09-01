@@ -1316,11 +1316,230 @@ func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 
 
 
+# for 和 for range
+
+## 循环永动机
+
+如果我们在遍历数组的同时修改数组的元素，能否得到一个永远都不会停止的循环呢？你可以自己尝试运行下面的代码来得到结果：
+
+```
+func main() {    
+	arr := []int{1, 2, 3}   
+  for _, v := range arr {        
+  	arr = append(arr, v)    
+  }  
+  fmt.Println(arr)}
+  
+  $ go run main.go
+  1 2 3 1 2 3
+```
+
+上述代码的输出意味着循环只遍历了原始切片中的三个元素，我们在遍历切片时追加的元素不会增加循环的执行次数，所以循环最终还是停了下来。
 
 
 
+对于切片的`for range`，它的底层代码就是：
+
+```
+//   for_temp := range
+//   len_temp := len(for_temp)
+//   for index_temp = 0; index_temp < len_temp; index_temp++ {
+//           value_temp = for_temp[index_temp]
+//           index = index_temp
+//           value = value_temp
+//           original body
+//   }
+```
+
+可以看到，在遍历之前就获取的切片的长度`len_temp := len(for_temp)`，遍历的次数不会随着切片的变化而变化，上面的代码自然不会是死循环了。
 
 
+
+## 神奇的指针
+
+```
+package main
+
+import "fmt"
+
+func main() {
+	arr := []int{1, 2, 3}
+	newArr := []*int{}
+	for _, v := range arr {
+		newArr = append(newArr, &v)
+	}
+	for _, v := range newArr {
+		fmt.Println(*v)
+	}
+}
+
+//输出 3 3 3
+/*
+	for range 是先计算长度，所一在append也不会无限循环，
+ 	v 是一个全局变量，每次循环都会赋值给它，这样最后赋值的是最后的3
+	所以存储的是一个地址 都是3，应该给&arr[i]
+*/
+```
+
+![image-20200806213338819](data.assets/image-20200806213338819.png)
+
+
+
+解决方法
+==局部变量==
+
+==索引使用原来的值==
+
+```
+那么怎么改？有两种
+
+使用局部变量拷贝v
+for _, v := range arr {
+    //局部变量v替换了v，也可用别的局部变量名
+    v := v
+    res = append(res, &v)
+}
+直接索引获取原来的元素
+//这种其实退化为for循环的简写
+for k := range arr {
+    res = append(res, &arr[k])
+}
+理顺了这个问题后边的坑基本都好发现了，来迅速过一遍
+```
+
+
+
+## 数组遍历浪费内存
+
+```
+/假设值都为1，这里只赋值3个
+var arr = [102400]int{1, 1, 1}
+for i, n := range arr {
+    //just ignore i and n for simplify the example
+    _ = i
+    _ = n
+}
+```
+
+答案是【有问题】！遍历前的拷贝对内存是极大浪费啊 怎么优化？有两种
+
+- 对数组取地址遍历`for i, n := range &arr`
+- 对数组做切片引用`for i, n := range arr[:]`
+
+反思题：对大量元素的 slice 和 map 遍历为啥不会有内存浪费问题？（提示，底层数据结构是否被拷贝）
+
+## 对数组便利重置效率高吗--==高==
+
+对大数组这样重置效率高么？
+
+```
+//假设值都为1，这里只赋值3个
+var arr = [102400]int{1, 1, 1}
+for i, _ := range &arr {
+    arr[i] = 0
+}
+```
+
+答案是【高】，这个要理解得知道 go 对这种重置元素值为默认值的遍历是有优化的, 详见**go 源码：memclrrange**[2]
+
+```
+// Lower n into runtime·memclr if possible, for
+// fast zeroing of slices and arrays (issue 5373).
+// Look for instances of
+//
+// for i := range a {
+// 	a[i] = zero
+// }
+//
+// in which the evaluation of a is side-effect-free.
+```
+
+## 对 map 遍历时删除元素能遍历到么？
+
+```go
+var m = map[int]int{1: 1, 2: 2, 3: 3}
+//only del key once, and not del the current iteration key
+var o sync.Once
+for i := range m {
+    o.Do(func() {
+        for _, key := range []int{1, 2, 3} {
+            if key != i {
+                fmt.Printf("when iteration key %d, del key %d\n", i, key)
+                delete(m, key)
+                break
+            }
+        }
+    })
+    fmt.Printf("%d%d ", i, m[i])
+}
+```
+
+答案是【不会】 map 内部实现是一个链式 hash 表，为保证每次无序，初始化时会**随机一个遍历开始的位置**[3], 这样，如果删除的元素开始没被遍历到（上边`once.Do`函数内保证第一次执行时删除未遍历的一个元素），那就后边就不会出现。
+
+## 对 map 遍历时新增元素能遍历到么？---map随机性
+
+```
+var m = map[int]int{1:1, 2:2, 3:3}
+for i, _ := range m {
+    m[4] = 4
+    fmt.Printf("%d%d ", i, m[i])
+}
+```
+
+答案是【可能会】，输出中可能会有`44`。原因同上一个, 可以用以下代码验证
+
+```
+var createElemDuringIterMap = func() {
+    var m = map[int]int{1: 1, 2: 2, 3: 3}
+    for i := range m {
+        m[4] = 4
+        fmt.Printf("%d%d ", i, m[i])
+    }
+}
+for i := 0; i < 50; i++ {
+    //some line will not show 44, some line will
+    createElemDuringIterMap()
+    fmt.Println()
+}
+```
+
+## 这样遍历中起 goroutine 可以么？传值拷贝
+
+```
+var m = []int{1, 2, 3}
+for i := range m {
+    go func() {
+        fmt.Print(i)
+    }()
+}
+//block main 1ms to wait goroutine finished
+time.Sleep(time.Millisecond)
+```
+
+答案是【不可以】。预期输出 0,1,2 的某个组合，如 012，210.. 结果是 222. 同样是拷贝的问题 怎么解决
+
+- 以参数方式传入
+
+```
+for i := range m {
+    gofunc(i int) {
+        fmt.Print(i)
+    }(i)
+}
+```
+
+- 使用局部变量拷贝
+
+```
+for i := range m {
+    i := i
+    gofunc() {
+        fmt.Print(i)
+    }()
+}
+```
+
+发现没，一个简单的 for-range，仔细剖析下来也是有不少有趣的地方。希望剖析后能让你更进一步的了解。
 
 
 
