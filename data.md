@@ -729,6 +729,38 @@ https://segmentfault.com/a/1190000018380327?utm_source=tag-newest
 
 
 
+
+
+## 数据结构图
+
+hmap
+
+![image-20200901213605565](data.assets/image-20200901213605565.png)
+
+bmap
+
+## 溢出桶
+
+![image-20200901213941443](data.assets/image-20200901213941443.png)
+
+![image-20200901214223936](data.assets/image-20200901214223936.png)
+
+![image-20200901214317529](data.assets/image-20200901214317529.png)
+
+## 扩容规则 负载因子是6.5
+
+元素数量 / 桶的数量
+
+## 扩容
+
+![image-20200901215033643](data.assets/image-20200901215033643.png)
+
+![image-20200901215209568](data.assets/image-20200901215209568.png)
+
+## 等量扩容
+
+![image-20200901215332145](data.assets/image-20200901215332145.png)
+
 ## 设计原理
 
 哈希函数和冲突解决方法
@@ -1046,12 +1078,190 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 
 ## 读写操作
 
+哈希表作为一种数据结构，我们肯定需要分析它的常见操作，首先就需要了解其读写操作的实现原理，访问哈希表一般都是通过下标或者遍历两种方式进行的：
 
+```
+_ = hash[key]
+for k, v := range hash {   
+	// k, v
+}
+```
+
+这两种方式虽然都能读取哈希表中的数据，但是使用的函数和底层的原理完全不同，前者需要知道哈希的键并且一次只能获取单个键对应的值，而后者可以遍历哈希中的全部键值对，访问数据时也不需要预先知道哈希的键，在这里我们会介绍前一种访问方式，第二种访问方式会在 `range` 一节中详细分析。
+
+数据结构的写一般指的都是增加、删除和修改，增加和修改字段都使用索引和赋值语句，而删除字典中的数据需要使用关键字 `delete`：
+
+```go
+hash[key] = value
+hash[key] = newValue
+delete(hash, key)
+```
+
+除了这些操作之外，我们还会分析哈希的扩容过程，这能帮助我们深入理解哈希是如何对数据进行存储的。
+
+### 访问
+
+在编译的[类型检查](https://www.bookstack.cn/read/draveness-golang/7ab240185c175c73.md)期间，`hash[key]` 以及类似的操作都会被转换成对哈希的 [`OINDEXMAP`](https://github.com/golang/go/blob/4d5bb9c60905b162da8b767a8a133f6b4edcaa65/src/cmd/compile/internal/gc/walk.go#L1089) 操作，[中间代码生成](https://www.bookstack.cn/read/draveness-golang/5a89e04c79706261.md)阶段会在 [`cmd/compile/internal/gc.walkexpr`](https://github.com/golang/go/blob/4d5bb9c60905b162da8b767a8a133f6b4edcaa65/src/cmd/compile/internal/gc/walk.go#L439-L1532) 函数中将这些 [`OINDEXMAP`](https://github.com/golang/go/blob/4d5bb9c60905b162da8b767a8a133f6b4edcaa65/src/cmd/compile/internal/gc/walk.go#L1089) 操作转换成如下的代码：
+
+```go
+v     := hash[key] // => v     := *mapaccess1(maptype, hash, &key)
+v, ok := hash[key] // => v, ok := mapaccess2(maptype, hash, &key)
+```
+
+赋值语句左侧接受参数的个数会决定使用的运行时方法：
+
+- 当接受参数仅为一个时，会使用 [`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450)，该函数仅会返回一个指向目标值的指针；
+- 当接受两个参数时，会使用 [`runtime.mapaccess2`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L452-L508)，除了返回目标值之外，它还会返回一个用于表示当前键对应的值是否存在的布尔值：[`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450) 函数会先通过哈希表设置的哈希函数、种子获取当前键对应的哈希，再通过 `bucketMask` 和 `add` 函数拿到该键值对所在的桶序号和哈希最上面的 8 位数字。
+
+```go
+func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer { 
+	alg := t.key.alg   
+  hash := alg.hash(key, uintptr(h.hash0))    
+  m := bucketMask(h.B)    
+  b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))   
+  top := tophash(hash)bucketloop:    
+  for ; b != nil; b = b.overflow(t) {        
+  	for i := uintptr(0); i < bucketCnt; i++ {            
+  		if b.tophash[i] != top {                
+        if b.tophash[i] == emptyRest {                   
+          break bucketloop               
+        }                
+        continue
+       }            
+       
+       k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+       if alg.equal(key, k) {                
+       		v := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))                					return v           
+       }        
+ 	 }     
+ }    
+  return unsafe.Pointer(&zeroVal[0])
+}
+```
+
+<font color=red size=4x>在 `bucketloop` 循环中，哈希会依次遍历正常桶和溢出桶中的数据，它会比较这 8 位数字和桶中存储的 `tophash`，每一个桶都存储键对应的 `tophash`，每一次读写操作都会与桶中所有的 `tophash` 进行比较，==用于选择桶序号的是哈希的最低几位==，而用于加速访问的是哈希的高 8 位，这种设计能够减少同一个桶中有大量相等 `tophash` 的概率。</font>
+
+![hashtable-mapaccess](data/398d3189d87a332a6f8d117aa79db5c4.png)
+
+**图 3-13 访问哈希表中的数据**
+
+如上图所示，==每一个桶都是一整片的内存空间==，<font color=green>当发现桶中的 `tophash` 与传入键的 `tophash` 匹配之后，我们会通过指针和偏移量获取哈希中存储的键 `keys[0]` 并与 `key` 比较，如果两者相同就会获取目标值的指针 `values[0]` 并返回。</font>
+
+另一个同样用于访问哈希表中数据的 [`runtime.mapaccess2`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L452-L508) 只是在 [`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450) 的基础上多返回了一个标识键值对是否存在的布尔值：
+
+```go
+func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) {   
+	...bucketloop:    
+	for ; b != nil; b = b.overflow(t) {        
+		for i := uintptr(0); i < bucketCnt; i++ {            
+			if b.tophash[i] != top {                
+        if b.tophash[i] == emptyRest {                    
+          break bucketloop               
+        }                
+        continue           
+      }            
+       k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))            
+       if alg.equal(key, k) {                
+       	v := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))                						return v, true            
+       }       
+    }    
+ }    
+ return unsafe.Pointer(&zeroVal[0]), false
+}
+```
+
+使用 `v, ok := hash[k]` 的形式访问哈希表中元素时，我们能够通过这个布尔值更准确地知道当 `v == nil` 时，`v` 到底是哈希中存储的元素还是表示该键对应的元素不存在，所以在访问哈希时，更推荐使用这一种方式先判断元素是否存在。
+
+上面的过程其实是在正常情况下，访问哈希表中元素时的表现，然而与数组一样，哈希表可能会在装载因子过高或者溢出桶过多时进行扩容，哈希表的扩容并不是一个原子的过程，在扩容的过程中保证哈希的访问是比较有意思的话题，我们在这里其实也省略了相关的代码，不过会在下面展开介绍。
+
+### 写入
+
+当形如 `hash[k]` 的表达式出现在赋值符号左侧时，该表达式也会在编译期间转换成调用 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数，该函数与 [`runtime.mapaccess1`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L394-L450) 比较相似，我们将该其分成几个部分分析，首先是函数会根据传入的键拿到对应的哈希和桶：
+
+```go
+func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {    
+	alg := t.key.alg    
+	hash := alg.hash(key, uintptr(h.hash0))    
+	h.flags ^= hashWritingagain:    
+	bucket := hash & bucketMask(h.B)    
+	b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) + bucket*uintptr(t.bucketsize)))    
+	top := tophash(hash)
+```
+
+<font color=red>然后通过遍历比较桶中存储的 `tophash` 和键的哈希，如果找到了相同结果就会获取目标位置的地址并返回，其中 `inserti` 表示目标元素的在桶中的索引，`insertk` 和 `val` 分别表示键值对的地址，获得目标地址之后会直接通过算术计算进行寻址获得键值对 `k` 和 `val`：</font>
+
+```go
+    var inserti *uint8    
+    var insertk unsafe.Pointer    
+    var val unsafe.Pointerbucketloop:    
+    for {        
+    	for i := uintptr(0); i < bucketCnt; i++ { 
+      	if b.tophash[i] != top {               
+            if isEmpty(b.tophash[i]) && inserti == nil {       
+              inserti = &b.tophash[i]                    
+              insertk = add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))                   
+              val = add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))                						}         
+          	if b.tophash[i] == emptyRest {   
+          		break bucketloop       
+            }                
+            continue           
+        }            
+        k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))            
+        if !alg.equal(key, k) {               
+        	continue            
+        }            
+        val = add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))            					goto done       
+        }        
+        
+        ovf := b.overflow(t)       
+        if ovf == nil {            
+        	break        
+        }       
+          
+        b = ovf   
+   }
+```
+
+在上述的 for 循环中会依次遍历正常桶和溢出桶中存储的数据，整个过程会依次判断 `tophash` 是否相等、`key` 是否相等，遍历结束后会从循环中跳出。
+
+![hashtable-overflow-bucket](https://static.bookstack.cn/projects/draveness-golang/b9a4c6b42f48ee8dc41ba280ba6fc176.png)
+
+**图 3-15 哈希遍历溢出桶**
+
+如果当前桶已经满了，哈希会调用 `newoverflow` 函数创建新桶或者使用 `hmap` 预先在 `noverflow` 中创建好的桶来保存数据，新创建的桶不仅会被追加到已有桶的末尾，还会增加哈希表的 `noverflow` 计数器。
+
+```go
+    if inserti == nil {        
+    	newb := h.newoverflow(t, b)       
+      inserti = &newb.tophash[0]        
+      insertk = add(unsafe.Pointer(newb), dataOffset)        
+      val = add(insertk, bucketCnt*uintptr(t.keysize))    
+    }    
+    
+    typedmemmove(t.key, insertk, key)    
+    *inserti = top    
+    h.count++done:    
+    return val
+ }
+```
+
+如果当前键值对在哈希中不存在，哈希为新键值对规划存储的内存地址，通过 `typedmemmove` 将键移动到对应的内存空间中并返回键对应值的地址 `val`，如果当前键值对在哈希中存在，那么就会直接返回目标区域的内存地址。哈希并不会在 `mapassign` 这个运行时函数中将值拷贝到桶中，该函数只会返回内存地址，真正的赋值操作是在编译期间插入的：
+
+```go
+00018 (+5) CALL runtime.mapassign_fast64(SB)
+00020 (5) MOVQ 24(SP), DI               ;; DI = &value
+00026 (5) LEAQ go.string."88"(SB), AX   ;; AX = &"88"
+00027 (5) MOVQ AX, (DI)                 ;; *DI = AX
+```
+
+[`runtime.mapassign_fast64`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map_fast64.go#L92-L180) 与 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数的实现差不多，我们需要关注的是后面的三行代码，`24(SP)` 就是该函数返回的值地址，我们通过 `LEAQ` 指令将字符串的地址存储到寄存器 `AX` 中，`MOVQ` 指令将字符串 `"88"` 存储到了目标地址上完成了这次哈希的写入。
 
 
 
 ## 扩容
 
+- 当链表越来越长，bucket的扩容次数达到一定值，<font color=red size=5x>其实是bmap扩容的加载因数达到6.5，bmap就会进行扩容，将原来bucket数组数量扩充一倍，产生一个新的bucket数组，也就是bmap的buckets属性指向的数组。这样bmap中的oldbuckets属性指向的就是旧bucket数组。</font>
+=======
 产生条件
 
 	1. 负载因子大于6.5 ----增倍扩容
@@ -1064,8 +1274,30 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 
 
 - 当链表越来越长，bucket的扩容次数达到一定值，其实是bmap扩容的加载因数达到6.5，bmap就会进行扩容，将原来bucket数组数量扩充一倍，产生一个新的bucket数组，也就是bmap的buckets属性指向的数组。这样bmap中的oldbuckets属性指向的就是旧bucket数组。
+>>>>>>> f7f884c7d9fb530dcb0fbb2a412cc0cc9e5071a7
 - 这里的加载因子LoadFactor是一个阈值，计算方式为（map长度/2^B ）如果超过6.5，将会进行扩容，这个是经过测试才得出的合理的一个阈值。因为，加载因子越小，空间利用率就小，加载因子越大，产生冲突的几率就大。所以6.5是一个平衡的值。
-- map的扩容不会立马全部复制，而是渐进式扩容，即首先开辟2倍的内存空间，创建一个新的bucket数组。只有当访问原来就的bucket数组时，才会将就得bucket拷贝到新的bucket数组，进行渐进式的扩容。当然旧的数据不会删除，而是去掉引用，等待gc回收。
+- map的扩容不会立马全部复制，==而是渐进式扩容==，即首先开辟2倍的内存空间，创建一个新的bucket数组。只有当访问原来就的bucket数组时，才会将就得bucket拷贝到新的bucket数组，进行渐进式的扩容。==当然旧的数据不会删除，而是去掉引用，等待gc回收。==
+
+
+
+我们在介绍哈希的写入过程时省略了扩容操作，随着哈希表中元素的逐渐增加，哈希的性能会逐渐恶化，所以我们需要更多的桶和更大的内存保证哈希的读写性能：
+
+```go
+func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {  
+	...    
+	if !h.growing() && (overLoadFactor(h.count+1, h.B) || tooManyOverflowBuckets(h.noverflow, h.B)) {        			hashGrow(t, h)        
+		goto again    
+	}    
+	...
+}
+```
+
+[`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数会在以下两种情况发生时触发哈希的扩容：
+
+- <font color=red size=5x>装载因子已经超过 6.5；</font>
+- <font color=red size=5x>哈希使用了太多溢出桶；不过由于 Go 语言哈希的扩容不是一个原子的过程，所以 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 函数还需要判断当前哈希是否已经处于扩容状态，避免二次扩容造成混乱。</font>
+
+==根据触发的条件不同扩容的方式分成两种，如果这次扩容是溢出的桶太多导致的，那么这次扩容就是等量扩容 ====`sameSizeGrow`，`sameSizeGrow` 是一种特殊情况下发生的扩容，当我们持续向哈希中插入数据并将它们全部删除时，如果哈希表中的数据量没有超过阈值，就会不断积累溢出桶造成缓慢的内存泄漏[4](https://www.bookstack.cn/read/draveness-golang/8a6fa5746b8fbe7e.md#fn:4)。[runtime: limit the number of map overflow buckets](https://github.com/golang/go/commit/9980b70cb460f27907a003674ab1b9bea24a847c) 引入了 `sameSizeGrow` 通过重用已有的哈希扩容机制，一旦哈希中出现了过多的溢出桶，它就会创建新桶保存数据，垃圾回收会清理老的溢出桶并释放内存[5](https://www.bookstack.cn/read/draveness-golang/8a6fa5746b8fbe7e.md#fn:5)。
 
 我们在介绍哈希的写入过程时省略了扩容操作，随着哈希表中元素的逐渐增加，哈希的性能会逐渐恶化，所以我们需要更多的桶和更大的内存保证哈希的读写性能：
 
@@ -1314,7 +1546,11 @@ func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 
 我们其实只需要知道 `delete` 关键字在编译期间经过[类型检查](https://www.bookstack.cn/read/draveness-golang/7ab240185c175c73.md)和[中间代码生成](https://www.bookstack.cn/read/draveness-golang/5a89e04c79706261.md)阶段被转换成 [`runtime.mapdelete`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L685-L791) 函数簇中的一员就可以，用于处理删除逻辑的函数与哈希表的 [`runtime.mapassign`](https://github.com/golang/go/blob/36f30ba289e31df033d100b2adb4eaf557f05a34/src/runtime/map.go#L571-L683) 几乎完全相同，不太需要刻意关注。
 
+## 为什么桶的数量必须是2的倍数
 
+<font color=red size=5x>hash & (m-1) 与运算是同时为1 才为真,所以必须是2的倍数才可以,不是2的倍数就会有的桶选不中</font>
+
+![image-20200901213041815](data.assets/image-20200901213041815.png)
 
 # for 和 for range
 
@@ -1427,6 +1663,275 @@ for i, n := range arr {
 - 对数组做切片引用`for i, n := range arr[:]`
 
 反思题：对大量元素的 slice 和 map 遍历为啥不会有内存浪费问题？（提示，底层数据结构是否被拷贝）
+=======
+# ==-------------关键字----------==
+
+# select
+
+很多 C 语言或者 Unix 开发者听到 `select` 想到的都是系统调用，而谈到 I/O 模型时最终大都会提到基于 `select`、`poll` 和 `epoll` 等函数构建的 IO 多路复用模型。Go 语言的 `select` 与 C 语言中的 `select` 有着比较相似的功能。
+
+C 语言中的 `select` 关键字可以同时监听多个文件描述符的可读或者可写的状态，Go 语言中的 `select` 关键字也能够让 Goroutine 同时等待多个 Channel 的可读或者可写，在多个文件或者 Channel 发生状态改变之前，`select` 会一直阻塞当前线程或者 Goroutine。
+
+![Golang-Select-Channels](data/d5f86fa94ffc8ee348eda427e3344f84.png)
+
+```go
+func fibonacci(c, quit chan int) {
+	x, y := 0, 1
+	for {
+		select {
+		case c <- x:
+			x, y = y, x+y
+		case <-quit:
+			fmt.Println("quit")
+			return
+		}
+	}
+}
+```
+
+上述控制结构会等待 `c <- x` 或者 `<-quit` 两个表达式中任意一个的返回。无论哪一个表达式返回都会立刻执行 `case` 中的代码，当 `select` 中的两个 `case` 同时被触发时，就会随机选择一个 `case` 执行。
+
+## 现象
+
+当我们在 Go 语言中使用 `select` 控制结构时，会遇到两个有趣的现象：
+
+- ==`select` 能在 Channel 上进行非阻塞的收发操作；==
+- ==`select` 在遇到多个 Channel 同时响应时会随机挑选 `case` 执行；这两个现象是学习 `select` 时经常会遇到的，我们来深入了解具体的场景并分析这两个现象背后的设计原理。==
+
+
+
+## 非阻塞的收发
+
+在通常情况下，`select` 语句会阻塞当前 Goroutine 并等待多个 Channel 中的一个达到可以收发的状态。但是如果 `select` 控制结构中包含 `default` 语句，那么这个 `select` 语句在执行时会遇到以下两种情况：
+
+- <font color=red size=5x>当存在可以收发的 Channel 时，直接处理该 Channel 对应的 `case`；</font>
+- <font color= red size=5x>当不存在可以收发的 Channel 是，执行 `default` 中的语句；当我们运行下面的代码时就不会阻塞当前的 Goroutine，它会直接执行 `default` 中的代码并返回。</font>
+
+```go
+func main() {
+	ch := make(chan int)
+	select {
+	case i := <-ch:
+		println(i)
+	default:
+		println("default")
+	}
+}
+```
+
+```go
+default
+```
+
+`select` 的作用就是同时监听多个 `case` 是否可以执行，如果多个 Channel 都不能执行，那么运行 `default` 中的代码也是理所当然的。
+
+非阻塞的 Channel 发送和接收操作还是很有必要的，在很多场景下我们不希望向 Channel 发送消息或者从 Channel 中接收消息会阻塞当前 Goroutine，我们只是向看看 Channel 的可读或者可写状态。下面就是一个常见的例子：
+
+```
+errCh := make(chan error, len(tasks)
+	wg := sync.WaitGroup{}
+	wg.Add(len(tasks))
+	for i := range tasks {
+		go func() {
+			defer wg.Done()
+			if err := tasks[i].Run(); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+```
+
+在上面这段代码中，我们不关心到底多少个任务执行失败了，只关心是否存在返回错误的任务，最后的 `select` 语句就能很好地完成这个任务。
+
+
+
+## 随机执行
+
+另一个使用 `select` 遇到的情况是同时有多个 `case` 就绪时，`select` 会选择那个 `case` 执行的问题，我们通过下面的代码可以简单了解一下：
+
+```go
+package main
+
+import "time"
+
+func main() {
+	ch := make(chan int)
+	go func() {
+		for range time.Tick(1 * time.Second) {
+			ch <- 0
+		}
+	}()
+	for {
+		select {
+		case c := <-ch:
+			println("case1")
+			println(c)
+		case <-ch:
+			println("case2")
+		}
+	}
+}
+
+```
+
+
+
+从上述代码输出的结果中我们可以看到，`select` 在遇到多个 `<-ch` 同时满足可读或者可写条件时会随机选择一个 `case` 执行其中的代码。
+
+这个设计是在十多年前被 [select](https://github.com/golang/go/commit/cb9b1038db77198c2b0961634cf161258af2374d) 提交[5](https://www.bookstack.cn/read/draveness-golang/1a4f7a284cd2b279.md#fn:5)引入并一直保留到现在的，虽然中间经历过一些修改[6](https://www.bookstack.cn/read/draveness-golang/1a4f7a284cd2b279.md#fn:6)，但是语义一直都没有改变。在上面的代码中，两个 `case` 都是同时满足执行条件的，<font color=red>如果我们按照顺序依次判断，那么后面的条件永远都会得不到执行，而随机的引入就是为了避免饥饿问题的发生。</font>
+
+## 数据结构
+
+`select` 在 Go 语言的源代码中不存在对应的结构体，但是 `select` 控制结构中的 `case` 却使用 [`runtime.scase`](https://github.com/golang/go/blob/d1969015b4ac29be4f518b94817d3f525380639d/src/runtime/select.go#L28-L34) 结构体来表示：
+
+```
+type scase struct {    
+	c           *hchan   
+  elem        unsafe.Pointer
+  kind        uint16    
+  pc          uintptr    
+  releasetime int64
+ }
+```
+
+因为非默认的 `case` 中都与 Channel 的发送和接收有关，所以 [`runtime.scase`](https://github.com/golang/go/blob/d1969015b4ac29be4f518b94817d3f525380639d/src/runtime/select.go#L28-L34) 结构体中也包含一个 [`runtime.hchan`](https://github.com/golang/go/blob/d1969015b4ac29be4f518b94817d3f525380639d/src/runtime/chan.go#L32-L51) 类型的字段存储 `case` 中使用的 Channel；除此之外，`elem` 是接收或者发送数据的变量地址、`kind` 表示 [`runtime.scase`](https://github.com/golang/go/blob/d1969015b4ac29be4f518b94817d3f525380639d/src/runtime/select.go#L28-L34) 的种类，总共包含以下四种：
+
+```go
+const (    
+	caseNil = iota
+  caseRecv    
+  caseSend    
+  caseDefault
+)
+```
+
+这四种常量分别表示不同类型的 `case`，相信它们的命名已经能够充分帮助我们理解它们的作用了，所以这里也不一一介绍了。
+
+## 实现原理
+
+# defer
+
+链表，每次有一个新的defer的时候回追加到最新的defer链表处
+
+作为一个编程语言中的关键字，`defer` 的实现一定是由编译器和运行时共同完成的
+
+```go
+func createPost(db *gorm.DB) error {
+	tx := db.Begin()
+	defer tx.Rollback()
+	if err := tx.Create(&Post{Author: "Draveness"}).Error; err != nil {
+		return err
+	}
+	return tx.Commit().Error
+}
+```
+
+在使用数据库事务时，我们可以使用如上所示的代码在创建事务之后就立刻调用 `Rollback` 保证事务一定会回滚。哪怕事务真的执行成功了，那么调用 `tx.Commit()` 之后再执行 `tx.Rollback()` 也不会影响已经提交的事务。
+
+现象
+
+## 数据结构
+
+在介绍 `defer` 函数的执行过程与实现原理之前，我们首先来了解一下 `defer` 关键字在 Go 语言源代码中对应的数据结构：
+
+```go
+type _defer struct {    
+	siz     int32    
+	started bool    
+	sp      uintptr   
+  pc      uintptr    
+  fn      *funcval   
+  _panic  *_panic    
+  link    *_defer
+}
+```
+
+[`runtime._defer`](https://github.com/golang/go/blob/cfe3cd903f018dec3cb5997d53b1744df4e53909/src/runtime/runtime2.go#L853-L878) 结构体是延迟调用链表上的一个元素，所有的结构体都会通过 `link` 字段串联成链表。
+
+![golang-defer-link](data/9aec08defae33c08897ca9b3a4f4c0d3.png)
+
+**图 5-10 延迟调用链表**
+
+我们简单介绍一下 [`runtime._defer`](https://github.com/golang/go/blob/cfe3cd903f018dec3cb5997d53b1744df4e53909/src/runtime/runtime2.go#L853-L878) 结构体中的几个字段：
+
+- `siz` 是参数和结果的内存大小；
+- `sp` 和 `pc` 分别代表栈指针和调用方的程序计数器；
+- `fn` 是 `defer` 关键字中传入的函数；
+- `_panic` 是触发延迟调用的结构体，可能为空；
+
+除了上述的这些字段之外，[`runtime._defer`](https://github.com/golang/go/blob/cfe3cd903f018dec3cb5997d53b1744df4e53909/src/runtime/runtime2.go#L853-L878) 中还包含一些垃圾回收机制使用的字段，这里为了减少理解的成本就都省去了。
+
+## 1.12 defer 流程
+
+1. ==先注册，后调用==
+
+2. deferproc进行注册 deferreturn 是调用
+
+3. 会预先分配deferpool，没有在进行分配
+
+4. 注册的时候会将局部变量从栈拷贝到堆上进行预分配空间，返回值在从堆上在拷贝回栈上，如果变量不是传入的外部变量，会进行取&操作，没有捕获列表
+
+5. <font color=red size=5x>捕获列表指的是，在defer的闭包函数内有引用的可能会在后续改变的参数，就会有捕获列表</font>，堆上存的是地址
+
+6. 闭包函数函数通过寄存器的funavalue 和偏移量获取参数列表
+
+7. 每个defer都会创建一个defer结构体
+
+   ```
+   type _defer struct {    
+   	siz     int32    //参数和返回值
+   	started bool    //是否执行
+   	sp      uintptr   //调用者栈指针
+     pc      uintptr    //返回地址
+     fn      *funcval   //注册的函数
+     _panic  *_panic    
+     link    *_defer//next _defer
+   }
+   ```
+
+8. <font color=red size=5x>go 1.12 defer 慢的原因</font>
+
+   1. defer 在堆上分配，注册的时候从栈上拷贝到堆上，返回的时候从堆上拷贝到栈上
+
+   2. _defer 是连表操作，连表本身比较慢
+
+      ![image-20200830210643237](data/image-20200830210643237.png)
+
+
+
+![image-20200830204925943](data/image-20200830204925943.png)
+
+![image-20200830205005933](data/image-20200830205005933.png) 
+
+![image-20200830205027667](data/image-20200830205027667.png)
+
+![image-20200830205247273](data/image-20200830205247273.png)
+
+![image-20200830205416370](data/image-20200830205416370.png)
+
+
+
+ 捕获列表
+
+![image-20200830210021829](data/image-20200830210021829.png)
+
+## go 1.13 1.14的defer优化
+
+1. <font color=red size=5x>正常的defer优化是 将堆分配改为存储在栈的局部变量中，减少堆分配的消耗</font>
+2. <font color=red size=5x>嵌套或者循环defer 增加了heap 来区分失去需要堆分配</font>
+3. <font color=red size=5x>隐式或者嵌套的defer不是和1.12一样，是从局部变量拷贝到栈的参数列表中</font>,1.13 号称提高30%
+4. <font color=red size=5x>1.14 中是将defer 预先和代码函数整合，在return之前调用defer函数</font>
+5. <font color=red size=5x>1.14中，如果在defer钱出现了panic的话就会通过==栈扫描==来顺序执行defer（因为没有了注册defer的连表了)，==此时panic就会变得很慢,panic的记录比defer低很多==</font>
+
+![image-20200830211302539](data/image-20200830211302539.png)
+>>>>>>> 9f65d5e0241461011d1f0270c231a8ffaac807c6
 
 ## 对数组便利重置效率高吗--==高==
 
@@ -1541,27 +2046,45 @@ for i := range m {
 
 发现没，一个简单的 for-range，仔细剖析下来也是有不少有趣的地方。希望剖析后能让你更进一步的了解。
 
+嵌套或者隐士
+
+![image-20200830211639632](data/image-20200830211639632.png)
+
+![image-20200830211709315](data/image-20200830211709315.png)
 
 
 
+## 1.14
+
+![image-20200830212202541](data/image-20200830212202541.png)
+
+ ![image-20200830212344946](data/image-20200830212344946.png)
 
 
 
+# panic rever
+
+1. 执行的goruntine除了支持defer的链表头信息<font color=red size=5x>,也会持有panic的连表头指针信息</font>
+2. <font color=red size=5x>panic 和defer的执行顺序，发生panic的时候，不会执行下面的代码，会出发defer==会优先将defer结构体中的是否执行标志改为true，防止defer中panic发生，而执行不了==</font>
+3. <font color=red size=5x>panic 打印错错误信息，会先打印开始的信息</font>
+4. recover 只是将panic的recoverd置为true
+5. 
+
+![image-20200830212711018](data/image-20200830212711018.png)
 
 
 
+2. 
+
+![image-20200830213325944](data/image-20200830213325944.png)
 
 
 
+![image-20200830213555972](data/image-20200830213555972.png)
 
+![image-20200830213654114](data/image-20200830213654114.png)
 
-
-
-
-
-
-
-
+![image-20200830214216747](data/image-20200830214216747.png)
 
 
 
