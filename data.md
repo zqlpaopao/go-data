@@ -2170,7 +2170,7 @@ for i := range m {
 
 # Mutex
 
-## 总结
+#### 总结
 
 - Mutex 是最简单的一种锁类型，同时也比较暴力，当一个 goroutine 获得了 Mutex 后，其他 goroutine 就只能乖乖等到这个 goroutine 释放该 Mutex。
 
@@ -2183,7 +2183,7 @@ for i := range m {
   - 运行队列P绑定M
 - 解锁的时候只需要修改相应的状态就可以
 
-## 简单实用
+#### 简单实用
 
 当有go程操作这个变量的时候被加锁了,其他的就只能等待这个锁被释放才能操作
 
@@ -2422,13 +2422,177 @@ func (m *Mutex) unlockSlow(new int32) {
 
 在正常模式下，如果当前互斥锁不存在等待者或者最低三位表示的状态都为 `0`，那么当前方法就不需要唤醒其他 Goroutine 可以直接返回，当有 Goroutine 正在处于等待状态时，还是会通过 `runtime_Semrelease` 唤醒对应的 Goroutine 并移交锁的所有权。
 
+# RWMutex
+
+#### 总结
+
+- 读和写或者释放所得动作都是原子性操作
+
+- `readerSem` — 读写锁释放时通知由于获取读锁等待的 Goroutine；
+- `writerSem` — 读锁释放时通知由于获取读写锁等待的 Goroutine；
+- `w` 互斥锁 — 保证写操作之间的互斥；
+- `readerCount` — 统计当前进行读操作的协程数，触发写锁时会将其减少 `rwmutexMaxReaders` 阻塞后续的读操作；
+- `readerWait` — 当前读写锁等待的进行读操作的协程数，在触发 `Lock` 之后的每次 `RUnlock` 都会将其减一，当它归零时该 Goroutine 就会获得读写锁；
+- 当读写锁被释放 `Unlock` 时首先会通知所有的读操作，然后才会释放持有的互斥锁，这样能够保证读操作不会被连续的写操作『饿死』；`RWMutex` 在 `Mutex` 之上提供了额外的读写分离功能，能够在读请求远远多于写请求时提供性能上的提升，我们也可以在场景合适时选择读写互斥锁。
 
 
 
+==在读多写少的环境中，可以优先使用读写互斥锁（sync.RWMutex），它比互斥锁更加高效。sync 包中的 RWMutex 提供了读写互斥锁的封装==
+
+读写锁分为：读锁和写锁
+
+- <font color=red size=5x>如果设置了一个写锁，那么其它读的线程以及写的线程都拿不到锁，这个时候，与互斥锁的功能相同</font>
+- <font color=red size=5x>如果设置了一个读锁，那么其它写的线程是拿不到锁的，但是其它读的线程是可以拿到锁</font>
+
+ #### 简单实用
+
+```
+package main
+import ("fmt"
+	"sync"
+)
+
+var (
+	count int
+	rwLock sync.RWMutex
+)
+
+func main() {
+	for i := 0; i < 2; i++ {
+		go func() {
+			for i := 1000000; i > 0; i-- {
+				rwLock.Lock()
+				count ++
+				rwLock.Unlock()
+			}
+			fmt.Println(count)
+		}()
+	}
+
+	fmt.Scanf("\n")  //等待子线程全部结束
+}
+
+```
 
 
 
+每次的结果都不一样,因为每次释放的时机不一样,所以获取到结果不一样,最后的协程只有自己,所有可以顺序释放和获取,回输出最后的结果
 
+1990436
+2000000
+
+
+
+1971957
+2000000
+
+
+
+读写互斥锁也是 Go 语言 `sync` 包为我们提供的接口之一，一个常见的服务对资源的读写比例会非常高，如果大多数的请求都是读请求，它们之间不会相互影响，那么我们为什么不能将对资源读和写操作分离呢？这也就是 `RWMutex` 读写互斥锁解决的问题，<font color=red size=5x>不限制对资源的并发读，但是读写、写写操作无法并行执行。</font>
+
+|      | 读   | 写   |
+| :--- | :--- | :--- |
+| 读   | Y    | N    |
+| 写   | N    | N    |
+
+读写互斥锁在 Go 语言中的实现是 `RWMutex`，其中不仅包含一个互斥锁，还持有两个信号量，分别用于写等待读和读等待写：
+
+```
+type RWMutex struct {   
+	w           Mutex    
+	writerSem   uint32    
+	readerSem   uint32    
+	readerCount int32    
+	readerWait  int32
+}
+```
+
+`readerCount` 存储了当前正在执行的读操作的数量，最后的 `readerWait` 表示当写操作被阻塞时等待的读操作个数。
+
+
+
+#### 读锁
+
+读锁的加锁非常简单，我们通过 `atomic.AddInt32` 方法为 `readerCount` 加一，如果该方法返回了负数说明当前有 Goroutine 获得了写锁，当前 Goroutine 就会调用 `runtime_SemacquireMutex` 陷入休眠等待唤醒：
+
+```
+func (rw *RWMutex) RLock() {
+	if atomic.AddInt32(&rw.readerCount, 1) < 0 {
+		runtime_SemacquireMutex(&rw.readerSem, false, 0)
+	}
+}
+```
+
+如果没有写操作获取当前互斥锁，当前方法就会在 `readerCount` 加一后返回；当 Goroutine 想要释放读锁时会调用 `RUnlock` 方法：
+
+```
+func (rw *RWMutex) RUnlock() {
+    if r := atomic.AddInt32(&rw.readerCount, -1); r < 0 {
+        rw.rUnlockSlow(r)
+    }
+}
+```
+
+该方法会在减少正在读资源的 `readerCount`，当前方法如果遇到了返回值小于零的情况，说明有一个正在进行的写操作，在这时就应该通过 `rUnlockSlow` 方法减少当前写操作等待的读操作数 `readerWait` 并在所有读操作都被释放之后触发写操作的信号量 `writerSem`：
+
+```
+func (rw *RWMutex) rUnlockSlow(r int32) {
+	if r+1 == 0 || r+1 == -rwmutexMaxReaders {
+		throw("sync: RUnlock of unlocked RWMutex")
+	}
+	if atomic.AddInt32(&rw.readerWait, -1) == 0 {
+		runtime_Semrelease(&rw.writerSem, false, 1)
+	}
+}
+```
+
+`writerSem` 在被触发之后，尝试获取读写锁的进程就会被唤醒并获得锁。
+
+
+
+#### 读写锁
+
+当资源的使用者想要获取读写锁时，就需要通过 `Lock` 方法了，在 `Lock` 方法中首先调用了读写互斥锁持有的 `Mutex` 的 `Lock` 方法保证其他获取读写锁的 Goroutine 进入等待状态，随后的 `atomic.AddInt32(&rw.readerCount, -rwmutexMaxReaders)` 其实是为了阻塞后续的读操作：
+
+```
+func (rw *RWMutex) Lock() {
+	rw.w.Lock()
+	r := atomic.AddInt32(&rw.readerCount, -rwmutexMaxReaders) + rwmutexMaxReaders
+	if r != 0 && atomic.AddInt32(&rw.readerWait, r) != 0 {
+		runtime_SemacquireMutex(&rw.writerSem, false, 0)
+	}
+}
+```
+
+如果当前仍然有其他 Goroutine 持有互斥锁的读锁，该 Goroutine 就会调用 `runtime_SemacquireMutex` 进入休眠状态，等待读锁释放时触发 `writerSem` 信号量将当前协程唤醒。
+
+对资源的读写操作完成之后就会将通过 `atomic.AddInt32(&rw.readerCount, rwmutexMaxReaders)` 变回正数并通过 for 循环触发所有由于获取读锁而陷入等待的 Goroutine：
+
+```
+func (rw *RWMutex) Unlock() {
+	r := atomic.AddInt32(&rw.readerCount, rwmutexMaxReaders)
+	if r >= rwmutexMaxReaders {
+		throw("sync: Unlock of unlocked RWMutex")
+	}
+	for i := 0; i < int(r); i++ {
+		runtime_Semrelease(&rw.readerSem, false, 0)
+	}
+	rw.w.Unlock()
+}
+```
+
+在方法的最后，`RWMutex` 会释放持有的互斥锁让其他的协程能够重新获取读写锁。
+
+#### 小结
+
+相比状态复杂的互斥锁 `Mutex` 来说，读写互斥锁 `RWMutex` 虽然提供的功能非常复杂，但是由于站在了 `Mutex` 的『肩膀』上，所以整体的实现上会简单很多。
+
+- `readerSem` — 读写锁释放时通知由于获取读锁等待的 Goroutine；
+- `writerSem` — 读锁释放时通知由于获取读写锁等待的 Goroutine；
+- `w` 互斥锁 — 保证写操作之间的互斥；
+- `readerCount` — 统计当前进行读操作的协程数，触发写锁时会将其减少 `rwmutexMaxReaders` 阻塞后续的读操作；
+- `readerWait` — 当前读写锁等待的进行读操作的协程数，在触发 `Lock` 之后的每次 `RUnlock` 都会将其减一，当它归零时该 Goroutine 就会获得读写锁；
+- 当读写锁被释放 `Unlock` 时首先会通知所有的读操作，然后才会释放持有的互斥锁，这样能够保证读操作不会被连续的写操作『饿死』；`RWMutex` 在 `Mutex` 之上提供了额外的读写分离功能，能够在读请求远远多于写请求时提供性能上的提升，我们也可以在场景合适时选择读写互斥锁。
 
 
 
