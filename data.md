@@ -2594,6 +2594,134 @@ func (rw *RWMutex) Unlock() {
 - `readerWait` — 当前读写锁等待的进行读操作的协程数，在触发 `Lock` 之后的每次 `RUnlock` 都会将其减一，当它归零时该 Goroutine 就会获得读写锁；
 - 当读写锁被释放 `Unlock` 时首先会通知所有的读操作，然后才会释放持有的互斥锁，这样能够保证读操作不会被连续的写操作『饿死』；`RWMutex` 在 `Mutex` 之上提供了额外的读写分离功能，能够在读请求远远多于写请求时提供性能上的提升，我们也可以在场景合适时选择读写互斥锁。
 
+# WaitGroup
+
+#### 总结
+
+- <font color=red size=5x>WaitGroup 提供`Add`、`Wait`、`done`三个方法,Add负责增加计数器,done负责发送信号,然后Add进行减一操作,等到计数器为0的时候会唤醒全部的休眠goroutine</font>
+- <font color=red size=5x>`Add` 不能在和 `Wait` 方法在 Goroutine 中并发调用，一旦出现就会造成程序崩溃；</font>
+- ==<font color=red size=5x>`WaitGroup` 必须在 `Wait` 方法返回之后才能被重新使用；</font>==
+- <font color=red size=5x>`Done` 只是对 `Add` 方法的简单封装，我们可以向 `Add` 方法传入任意负数（需要保证计数器非负）快速将计数器归零以唤醒其他等待的 Goroutine；</font>
+- <font color=red size=5x>可以同时有多个 Goroutine 等待当前 `WaitGroup` 计数器的归零，这些 Goroutine 也会被『同时』唤醒；</font>
+
+
+
+
+
+`WaitGroup` 是 Go 语言 `sync` 包中比较常见的同步机制，它可以用于等待一系列的 Goroutine 的返回，一个比较常见的使用场景是批量执行 RPC 或者调用外部服务：
+
+```
+requests := []*Request{...}
+wg := &sync.WaitGroup{}
+wg.Add(len(requests))
+for _, request := range requests {
+  go func(r *Request) {
+    defer wg.Done()
+    // res, err := service.call(r)
+  }(request)
+}
+wg.Wait()
+```
+
+通过 `WaitGroup` 我们可以在多个 Goroutine 之间非常轻松地同步信息，原本顺序执行的代码也可以在多个 Goroutine 中并发执行，加快了程序处理的速度，在上述代码中只有在所有的 Goroutine 都执行完毕之后 `Wait` 方法才会返回，程序可以继续执行其他的逻辑。
+
+![image-20200921213258329](data.assets/image-20200921213258329.png)
+
+总而言之，它的作用就像它的名字一样，，通过<font color=red size=5x> `Done` 来传递任务完成的信号，比较常用于等待一组 Goroutine 中并发执行的任务全部结束。</font>
+
+#### 结构体
+
+`WaitGroup` 结构体中的成员变量非常简单，其中的 `noCopy` 的主要作用就是保证 `WaitGroup` 不会被开发者通过再赋值的方式进行拷贝，进而导致一些诡异的行为：
+
+```
+type WaitGroup struct {   
+	noCopy noCopy    
+	state1 [3]uint32
+}
+```
+
+[copylock](http://golang.so/pkg/cmd/vendor/golang.org/x/tools/go/analysis/passes/copylock/) 包就是一个用于检查类似错误的分析器，它的原理就是在 [编译期间](https://www.bookstack.cn/read/draveness-golang/9e405d643b49d00e.md) 检查被拷贝的变量中是否包含 `noCopy` 或者 `sync` 关键字，如果包含当前关键字就会报出以下的错误：
+
+```
+package main
+import (
+    "fmt"
+    "sync"
+)
+func main() {
+    wg := sync.Mutex{}
+    yawg := wg
+    fmt.Println(wg, yawg)
+}
+$ go run proc.go
+./prog.go:10:10: assignment copies lock value to yawg: sync.Mutex
+./prog.go:11:14: call of fmt.Println copies lock value: sync.Mutex
+./prog.go:11:18: call of fmt.Println copies lock value: sync.Mutex
+```
+
+除了 `noCopy` 之外，`WaitGroup` 结构体中还包含一个总共占用 12 字节大小的数组，这个数组中会存储当前结构体持有的状态和信号量，在 64 位与 32 位的机器上表现也非常不同。
+
+![image-20200921213451489](data.assets/image-20200921213451489.png)
+
+`WaitGroup` 提供了私有方法 `state` 能够帮助我们从 `state1` 字段中取出它的状态和信号量。
+
+#### 操作
+
+`WaitGroup` 对外暴露的接口只有三个 `Add`、`Wait` 和 `Done`，其中 `Done` 方法只是调用了 `wg.Add(-1)` 本身并没有什么特殊的逻辑，我们来了解一下剩余的两个方法：
+
+```
+func (wg *WaitGroup) Add(delta int) {
+    statep, semap := wg.state()
+    state := atomic.AddUint64(statep, uint64(delta)<<32)
+    v := int32(state >> 32)
+    w := uint32(state)
+    if v < 0 {
+        panic("sync: negative WaitGroup counter")
+    }
+    if v > 0 || w == 0 {
+        return
+    }
+    *statep = 0
+    for ; w != 0; w-- {
+        runtime_Semrelease(semap, false, 0)
+    }
+}
+```
+
+<font color=red size=5x> `Add` 方法的主要作用就是更新 `WaitGroup` 中持有的计数器 `counter`，64 位状态的高 32 位，虽然 `Add` 方法传入的参数可以为负数，但是一个 `WaitGroup` 的计数器只能是非负数，当调用 ==`Add` 方法导致计数器归零并且还有等待的 Goroutine 时，就会通过 `runtime_Semrelease` 唤醒处于等待状态的所有 Goroutine。==</font>
+
+另一个 `WaitGroup` 的方法 `Wait` 就会在当前计数器中保存的数据大于 `0` 时修改等待 Goroutine 的个数 `waiter` 并调用 `runtime_Semacquire` 陷入睡眠状态。
+
+```
+func (wg *WaitGroup) Wait() {
+    statep, semap := wg.state()
+    for {
+        state := atomic.LoadUint64(statep)
+        v := int32(state >> 32)
+        if v == 0 {
+            return
+        }
+        if atomic.CompareAndSwapUint64(statep, state, state+1) {
+            runtime_Semacquire(semap)
+            if +statep != 0 {
+                panic("sync: WaitGroup is reused before previous Wait has returned")
+            }
+            return
+        }
+    }
+}
+```
+
+陷入睡眠的 Goroutine 就会等待 `Add` 方法在计数器为 `0` 时唤醒。
+
+# Once
+
+#### 总结
+
+- <font color=red size=5x>Once只对外提供了==do==方法</font>
+- <font color=red size=5x>结构体由done uint32和m Mutex组成,done代表执行的次数,m是`获取次数(并发读写会影响结果,所以加锁)`的时候加锁处理</font>
+- <font color=red size=5x>==无论是否执行成功,都会deferatomic.StoreUint32(&o.done, 1) 加1操作==</font>
+- 如果当前done是0,则会执行,否则直接返回
 
 
 
@@ -2601,16 +2729,133 @@ func (rw *RWMutex) Unlock() {
 
 
 
+Go 语言在标准库的 `sync` 同步包中还提供了 `Once` 语义，它的主要功能其实也很好理解，保证在 Go 程序运行期间 `Once` 对应的某段代码只会执行一次。
 
+在如下所示的代码中，`Do` 方法中传入的函数只会被执行一次，也就是我们在运行如下所示的代码时只会看见一次 `only once` 的输出结果：
 
+```
+func main() {
+    o := &sync.Once{}
+    for i := 0; i < 10; i++ {
+        o.Do(func() {
+            fmt.Println("only once")
+        })
+    }
+}
+$ go run main.go
+only once
+```
 
+作为 `sync` 包中的结构体，`Once` 有着非常简单的数据结构，每一个 `Once` 结构体中都只包含一个用于标识代码块是否被执行过的 `done` 以及一个互斥锁 `Mutex`：
 
+```
+type Once struct {
+    done uint32
+    m    Mutex
+}
+```
 
+`Once` 结构体对外唯一暴露的方法就是 `Do`，该方法会接受一个入参为空的函数，如果使用 `atomic.LoadUint32` 检查到已经执行过函数了，就会直接返回，否则就会进入 `doSlow` 运行传入的函数：
 
+```
+func (o *Once) Do(f func()) {
+    if atomic.LoadUint32(&o.done) == 0 {
+        o.doSlow(f)
+    }
+}
+func (o *Once) doSlow(f func()) {
+    o.m.Lock()
+    defer o.m.Unlock()
+    if o.done == 0 {
+        defer atomic.StoreUint32(&o.done, 1)
+        f()
+    }
+}
+```
 
+`doSlow` 的实现也非常简单，我们先为当前的 Goroutine 获取互斥锁，然后通过 `defer` 关键字将 `done` 成员变量设置成 `1` 并运行传入的函数，无论当前函数是正常运行还是抛出 `panic`，当前方法都会将 `done` 设置成 `1` 保证函数不会执行第二次。
 
+# Cond
 
+==<font color=red size=5x>Go 语言在标准库中提供的 `Cond` 其实是一个条件变量，通过 `Cond` 我们可以让一系列的 Goroutine 都在触发某个事件或者条件时才被唤醒，每一个 `Cond` 结构体都包含一个互斥锁 `L`，我们先来看一下 `Cond` 是如何使用的：</font>==
 
+```
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/signal"
+	"sync"
+	"time"
+)
+
+func main() {
+	c := sync.NewCond(&sync.Mutex{})
+	for i := 0; i < 10; i++ {
+		go listen(c)
+	}
+	time.Sleep(1*time.Second)
+	go broadcast(c)
+	ch := make(chan os.Signal, 1)
+	/*
+	* Notify函数让signal包将输入信号转发到c。如果没有列出要传递的信号，
+	会将所有输入信号传递到c；否则只传递列出的输入信号。
+
+	signal包不会为了向c发送信息而阻塞（就是说如果发送时c阻塞了，signal包会直接放弃）：
+	调用者应该保证c有足够的缓存空间可以跟上期望的信号频率。对使用单一信号用于通知的通道，缓存为1就足够了。
+	 signal.Notify(ch, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM,
+	syscall.SIGSTOP, syscall.SIGUSR1)
+	*/
+	signal.Notify(ch, os.Interrupt)
+	<-ch
+}
+func broadcast(c *sync.Cond) {
+	c.L.Lock()
+	c.Broadcast()
+	c.L.Unlock()
+}
+func listen(c *sync.Cond) {
+	c.L.Lock()
+	c.Wait()
+	fmt.Println("listen")
+	c.L.Unlock()
+}
+
+```
+
+在上述代码中我们同时运行了 11 个 Goroutine，其中的 10 个 Goroutine 会通过 `Wait` 等待期望的信号或者事件，而剩下的一个 Goroutine 会调用 `Broadcast` 方法通知所有陷入等待的 Goroutine，当调用 `Boardcast` 方法之后，就会打印出 10 次 `"listen"` 并结束调用。
+
+注意: 是调用了Broadcast之后,瞬间打印的
+
+![image-20200921220350452](data.assets/image-20200921220350452.png)
+
+#### 结构体
+
+`Cond` 的结构体中包含 `noCopy` 和 `copyChecker` 两个字段，前者用于保证 `Cond` 不会再编译期间拷贝，后者保证在运行期间发生拷贝会直接 `panic`，持有的另一个锁 `L` 其实是一个接口 `Locker`，任意实现 `Lock` 和 `Unlock` 方法的结构体都可以作为 `NewCond` 方法的参数：
+
+```
+type Cond struct {
+    noCopy noCopy
+    L Locker
+    notify  notifyList
+    checker copyChecker
+}
+```
+
+结构体中最后的变量 `notifyList` 其实也就是为了实现 `Cond` 同步机制，该结构体其实就是一个 `Goroutine` 的链表：
+
+```
+type notifyList struct {
+    wait uint32
+    notify uint32
+    lock mutex
+    head *sudog
+    tail *sudog
+}
+```
+
+在这个结构体中，`head` 和 `tail` 分别指向的就是整个链表的头和尾，而 `wait` 和 `notify` 分别表示当前正在等待的 Goroutine 和已经通知到的 Goroutine，我们通过这两个变量就能确认当前待通知和已通知的 Goroutine。
 
 
 
