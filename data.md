@@ -2779,6 +2779,14 @@ func (o *Once) doSlow(f func()) {
 
 ==<font color=red size=5x>Go 语言在标准库中提供的 `Cond` 其实是一个条件变量，通过 `Cond` 我们可以让一系列的 Goroutine 都在触发某个事件或者条件时才被唤醒，每一个 `Cond` 结构体都包含一个互斥锁 `L`，我们先来看一下 `Cond` 是如何使用的：</font>==
 
+#### 总结
+
+- <font color=red size=5x>`Cond`提供了类似队列FIFO的等待机制，同时也提供`Signal唤醒队列最久一个`、`Broadcast全部唤醒`</font>
+- <font color=red size=5x>相比于使用 `for {}` 忙碌等待，使用 `Cond` 能够在遇到长时间条件无法满足时将当前处理器让出的功能，如果我们合理使用还是能够在一些情况下提升性能</font>
+- `Wait` 方法在调用之前一定要使用 `L.Lock` 持有该资源，否则会发生 `panic` 导致程序崩溃；
+- `Signal` 方法唤醒的 Goroutine 都是队列最前面、等待最久的 Goroutine；
+- `Broadcast` 虽然是广播通知全部等待的 Goroutine，但是真正被唤醒时也是按照一定顺序的；
+
 ```
 package main
 
@@ -2857,6 +2865,328 @@ type notifyList struct {
 
 在这个结构体中，`head` 和 `tail` 分别指向的就是整个链表的头和尾，而 `wait` 和 `notify` 分别表示当前正在等待的 Goroutine 和已经通知到的 Goroutine，我们通过这两个变量就能确认当前待通知和已通知的 Goroutine。
 
+#### 操作
+
+`Cond` 对外暴露的 `Wait` 方法会将当前 Goroutine 陷入休眠状态，它会先调用 `runtime_notifyListAdd` 将等待计数器 `+1`，然后解锁并调用 `runtime_notifyListWait` 等待其他 Goroutine 的唤醒：
+
+```go
+func (c *Cond) Wait() {
+    c.checker.check()
+    t := runtime_notifyListAdd(&c.notify)
+    c.L.Unlock()
+    runtime_notifyListWait(&c.notify, t)
+    c.L.Lock()
+}
+func notifyListAdd(l *notifyList) uint32 {
+    return atomic.Xadd(&l.wait, 1) - 1
+}
+```
+
+`notifyListWait` 方法的主要作用就是获取当前的 Goroutine 并将它追加到 `notifyList` 链表的最末端：
+
+```
+func notifyListWait(l *notifyList, t uint32) {
+    lock(&l.lock)
+    if less(t, l.notify) {
+        unlock(&l.lock)
+        return
+    }
+    s := acquireSudog()
+    s.g = getg()
+    s.ticket = t
+    if l.tail == nil {
+        l.head = s
+    } else {
+        l.tail.next = s
+    }
+    l.tail = s
+    goparkunlock(&l.lock, waitReasonSyncCondWait, traceEvGoBlockCond, 3)
+    releaseSudog(s)
+}
+```
+
+除了将当前 Goroutine 追加到链表的末端之外，我们还会调用 `goparkunlock` 陷入休眠状态，该函数也是在 Go 语言切换 Goroutine 时经常会使用的方法，它会直接让出当前处理器的使用权并等待调度器的唤醒。
+
+![image-20200923135815096](data/image-20200923135815096.png)
+
+`Cond` 对外提供的 `Signal` 和 `Broadcast` 方法就是用来唤醒调用 `Wait` 陷入休眠的 Goroutine，从两个方法的名字来看，前者会唤醒队列最前面的 Goroutine，后者会唤醒队列中全部的 Goroutine：
+
+```
+func (c *Cond) Signal() {
+    c.checker.check()
+    runtime_notifyListNotifyOne(&c.notify)
+}
+func (c *Cond) Broadcast() {
+    c.checker.check()
+    runtime_notifyListNotifyAll(&c.notify)
+}
+```
+
+`notifyListNotifyAll` 方法会从链表中取出全部的 Goroutine 并为它们依次调用 `readyWithTime`，该方法会通过 `goready` 将目标的 Goroutine 唤醒：
+
+```
+func notifyListNotifyAll(l *notifyList) {
+    s := l.head
+    l.head = nil
+    l.tail = nil
+    atomic.Store(&l.notify, atomic.Load(&l.wait))
+    for s != nil {
+        next := s.next
+        s.next = nil
+        readyWithTime(s, 4)
+        s = next
+    }
+}
+
+```
+
+虽然它会依次唤醒全部的 Goroutine，但是这里唤醒的顺序其实也是按照加入队列的先后顺序，先加入的会先被 `goready` 唤醒，后加入的 Goroutine 可能就需要等待调度器的调度。
+
+而 `notifyListNotifyOne` 函数就只会从 `sudog` 构成的链表中满足 `sudog.ticket == l.notify` 的 Goroutine 并通过 `readyWithTime` 唤醒：
+
+```
+func notifyListNotifyOne(l *notifyList) {
+    t := l.notify
+    atomic.Store(&l.notify, t+1)
+    for p, s := (*sudog)(nil), l.head; s != nil; p, s = s, s.next {
+        if s.ticket == t {
+            n := s.next
+            if p != nil {
+                p.next = n
+            } else {
+                l.head = n
+            }
+            if n == nil {
+                l.tail = p
+            }
+            s.next = nil
+            readyWithTime(s, 4)
+            return
+        }
+    }
+}
+```
+
+在一般情况下我们都会选择在不满足特定条件时调用 `Wait` 陷入休眠，当某些 Goroutine 检测到当前满足了唤醒的条件，就可以选择使用 `Signal` 通知一个或者 `Broadcast` 通知全部的 Goroutine 当前条件已经满足，可以继续完成工作了。
+
+# ErrGroup
+
+#### 总结
+
+- 出现错误或者等待结束后都会调用 `Context` 的 `cancel` 方法取消上下文；
+- 只有第一个出现的错误才会被返回，剩余的错误都会被直接抛弃；
+- 用WaitGroup 加 chan 也可以实现
+
+#### 使用1
+
+```
+package main
+
+import (
+	"errors"
+	"fmt"
+	"golang.org/x/sync/errgroup"
+)
+
+func main() {
+	group := new(errgroup.Group)
+	nums := []int{-1, 0, 1}
+
+	for _, num := range nums {
+		tempNum := num // 子协程中若直接访问num，则可能是同一个变量，所以要用临时变量
+
+		// 子协程
+		group.Go(func() error {
+			if tempNum < 0 {
+				return errors.New("tempNum < 0 !!!")
+			}
+			fmt.Println("tempNum:", tempNum)
+			return nil
+		})
+	}
+
+	// 捕获err
+	if err := group.Wait(); err != nil {
+		fmt.Println("Get errors: ", err)
+	} else {
+		fmt.Println("Get all num successfully!")
+	}
+}
+
+```
+
+tempNum: 1
+tempNum: 0
+Get errors:  tempNum < 0 !!!
+
+报错了后边的就不执行了
+
+#### 使用2
+
+```
+package main
+
+import (
+	"fmt"
+	xContext "golang.org/x/net/context"
+	"golang.org/x/sync/errgroup"
+)
+
+func main() {
+	ctx, cancel := xContext.WithCancel(xContext.Background())
+	group, errCtx := errgroup.WithContext(ctx)
+
+	for index := 0; index < 3; index++ {
+		indexTemp := index // 子协程中若直接访问index，则可能是同一个变量，所以要用临时变量
+
+		// 新建子协程
+		group.Go(func() error {
+			fmt.Printf("indexTemp=%d \n", indexTemp)
+			if indexTemp == 0 {
+				fmt.Println("indexTemp == 0 start ")
+				fmt.Println("indexTemp == 0 end")
+			} else if indexTemp == 1 {
+				fmt.Println("indexTemp == 1 start")
+				//这里一般都是某个协程发生异常之后，调用cancel()
+				//这样别的协程就可以通过errCtx获取到err信息，以便决定是否需要取消后续操作
+				cancel()
+				fmt.Println("indexTemp == 1 err ")
+			} else if indexTemp == 2 {
+				fmt.Println("indexTemp == 2 begin")
+
+				// 休眠1秒，用于捕获子协程2的出错
+				//time.Sleep(1 * time.Second)
+
+				//检查 其他协程已经发生错误，如果已经发生异常，则不再执行下面的代码
+				err := CheckGoroutineErr(errCtx)
+				if err != nil {
+					return err
+				}
+				fmt.Println("indexTemp == 2 end ")
+			}
+			return nil
+		})
+	}
+
+	// 捕获err
+	err := group.Wait()
+	if err == nil {
+		fmt.Println("都完成了")
+	} else {
+		fmt.Printf("get error:%v", err)
+	}
+}
+
+//校验是否有协程已发生错误
+func CheckGoroutineErr(errContext xContext.Context) error {
+	select {
+	case <-errContext.Done():
+		return errContext.Err()
+	default:
+		return nil
+	}
+}
+
+```
+
+indexTemp=2 
+indexTemp == 2 begin
+indexTemp=1 
+indexTemp == 1 start
+indexTemp == 1 err 
+indexTemp=0 
+indexTemp == 0 start 
+indexTemp == 0 end
+get error:context canceled
+
+==<font color=red size=5x>报错了，有canal的会成为主程继续执行，其他的则收到err的会停止执行</font>==
+
+子仓库 `x/sync` 中的包 [errgroup](https://godoc.org/golang.org/x/sync/errgroup) 其实就为我们在一组 Goroutine 中提供了同步、错误传播以及上下文取消的功能，我们可以使用如下所示的方式并行获取网页的数据：
+
+```go
+var g errgroup.Group
+var urls = []string{
+    "http://www.golang.org/",
+    "http://www.google.com/",
+    "http://www.somestupidname.com/",
+}
+for i := range urls {
+    url := urls[i]
+    g.Go(func() error {
+        resp, err := http.Get(url)
+        if err == nil {
+            resp.Body.Close()
+        }
+        return err
+    })
+}
+if err := g.Wait(); err == nil {
+    fmt.Println("Successfully fetched all URLs.")
+}
+
+```
+
+`Go` 方法能够创建一个 Goroutine 并在其中执行传入的函数，而 `Wait` 方法会等待 `Go` 方法创建的 Goroutine 全部返回后返回第一个非空的错误，如果所有的 Goroutine 都没有返回错误，该函数就会返回 `nil`。
+
+#### 结构体
+
+`errgroup` 包中的 `Group` 结构体同时由三个比较重要的部分组成：
+
+- <font color=red size=5x>创建 `Context` 时返回的 `cancel` 函数，主要用于通知使用 `context` 的 Goroutine 由于某些子任务出错，可以停止工作让出资源了；</font>
+- <font color=red size=5x>用于等待一组 Goroutine 完成子任务的 `WaitGroup` 同步原语；</font>
+- <font color=red size=5x>用于接受子任务返回错误的 `err` 和保证 `err` 只会被赋值一次的 `errOnce`；</font>
+
+```
+type Group struct {
+    cancel func()
+    wg sync.WaitGroup
+    errOnce sync.Once
+    err     error
+}
+```
+
+这些字段共同组成了 `Group` 结构体并为我们提供同步、错误传播以及上下文取消等功能。
+
+#### 操作
+
+`errgroup` 对外唯一暴露的构造器就是 `WithContext` 方法，我们只能从一个 `Context` 中创建一个新的 `Group` 变量，`WithCancel` 返回的取消函数也仅会在 `Group` 结构体内部使用：
+
+```
+func WithContext(ctx context.Context) (*Group, context.Context) {
+    ctx, cancel := context.WithCancel(ctx)
+    return &Group{cancel: cancel}, ctx
+}
+```
+
+创建新的并行子任务需要使用 `Go` 方法，这个方法内部会对 `WaitGroup` 加一并创建一个新的 Goroutine，在 Goroutine 内部运行子任务并在返回错误时及时调用 `cancel` 并对 `err` 赋值，只有最早返回的错误才会被上游感知到，后续的错误都会被舍弃：
+
+```
+func (g *Group) Go(f func() error) {
+    g.wg.Add(1)
+    go func() {
+        defer g.wg.Done()
+        if err := f(); err != nil {
+            g.errOnce.Do(func() {
+                g.err = err
+                if g.cancel != nil {
+                    g.cancel()
+                }
+            })
+        }
+    }()
+}
+func (g *Group) Wait() error {
+    g.wg.Wait()
+    if g.cancel != nil {
+        g.cancel()
+    }
+    return g.err
+}
+```
+
+`Wait` 方法其实就只是调用了 `WaitGroup` 的同步方法，在子任务全部完成时取消 `Context` 并返回可能出现的错误。
+
+# semaphore
 
 
 
@@ -2864,26 +3194,584 @@ type notifyList struct {
 
 
 
+#### 简单协程池
+
+```
+package main
+
+import "time"
+
+func main() {
+
+}
+
+type Semaphore struct {
+	permits int      // 许可数量
+	channel chan int // 通道
+}
+
+/* 创建信号量 */
+func NewSemaphore(permits int) *Semaphore {
+	return &Semaphore{channel: make(chan int, permits), permits: permits}
+}
+
+/* 获取许可 */
+func (s *Semaphore) Acquire() {
+	s.channel <- 0
+}
+
+/* 释放许可 */
+func (s *Semaphore) Release() {
+	<-s.channel
+}
+
+/* 尝试获取许可 */
+func (s *Semaphore) TryAcquire() bool {
+	select {
+	case s.channel <- 0:
+		return true
+	default:
+		return false
+	}
+}
+
+/* 尝试指定时间内获取许可 */
+func (s *Semaphore) TryAcquireOnTime(timeout time.Duration) bool {
+	for {
+		select {
+		case s.channel <- 0:
+			return true
+		case <-time.After(timeout):
+			return false
+		}
+	}
+}
+
+/* 当前可用的许可数 */
+func (s *Semaphore) AvailablePermits() int {
+	return s.permits - len(s.channel)
+}
+
+```
+
+# SingleFlight
+
+#### 总结
+
+- <font color=red size=5x>提供了三个参数`Do同步通知`、`Dochan异步chan通知`、`Forget删除map的存在的键值`</font>
+- <font size=5x color=green>每次调用都会重置map</font>
+- <font size=5x color=green>结构体是由`mu sync.Mutex `、`m  map[string]*call`组成，mu用于操作的排它锁，m用于存储已有的键值的个数</font>
+- <font size=5x color=green>如果m中存在当前键值对，就会阻塞等待，不存在的时候会加创建call结构存入m中</font>
+- <font size=5x color=green>Dochan会异步执行，将结果放入chan通知其他阻塞的协程</font>
+- <font size=5x color=green>阻塞的协程永的WaitGroup实现</font>
+
+#### do 的简单使用
+
+```go
+package main
+
+import (
+	"time"
+
+	"golang.org/x/sync/singleflight"
+	"log"
+)
+
+func main() {
+	var singleSetCache singleflight.Group
+
+	getAndSetCache := func(requestID int, cacheKey string) (string, error) {
+		log.Printf("request %v start to get and set cache...", requestID)
+		value, _, _ := singleSetCache.Do(cacheKey, func() (ret interface{}, err error) { //do的入参key，可以直接使用缓存的key，这样同一个缓存，只有一个协程会去读DB
+			log.Printf("request %v is setting cache...", requestID)
+			time.Sleep(3 * time.Second)
+			log.Printf("request %v set cache success!", requestID)
+			return "VALUE", nil
+		})
+		return value.(string), nil
+	}
+
+	cacheKey := "cacheKey"
+	for i := 1; i < 10; i++ { //模拟多个协程同时请求
+		go func(requestID int) {
+			value, _ := getAndSetCache(requestID, cacheKey)
+			log.Printf("request %v get value: %v", requestID, value)
+		}(i)
+	}
+	time.Sleep(20 * time.Second)
+
+	for i := 1; i < 10; i++ { //模拟多个协程同时请求
+		go func(requestID int) {
+			value, _ := getAndSetCache(requestID, cacheKey)
+			log.Printf("request %v get value: %v", requestID, value)
+		}(i)
+	}
+
+	time.Sleep(20 * time.Second)
+}
+
+```
+
+```
+2020/09/28 14:12:11 request 3 start to get and set cache...
+2020/09/28 14:12:11 request 3 is setting cache...
+2020/09/28 14:12:11 request 1 start to get and set cache...
+2020/09/28 14:12:11 request 2 start to get and set cache...
+2020/09/28 14:12:11 request 9 start to get and set cache...
+2020/09/28 14:12:11 request 6 start to get and set cache...
+2020/09/28 14:12:11 request 7 start to get and set cache...
+2020/09/28 14:12:11 request 4 start to get and set cache...
+2020/09/28 14:12:11 request 5 start to get and set cache...
+2020/09/28 14:12:11 request 8 start to get and set cache...
+2020/09/28 14:12:14 request 3 set cache success!
+2020/09/28 14:12:14 request 3 get value: VALUE
+2020/09/28 14:12:14 request 8 get value: VALUE
+2020/09/28 14:12:14 request 1 get value: VALUE
+2020/09/28 14:12:14 request 2 get value: VALUE
+2020/09/28 14:12:14 request 9 get value: VALUE
+2020/09/28 14:12:14 request 6 get value: VALUE
+2020/09/28 14:12:14 request 7 get value: VALUE
+2020/09/28 14:12:14 request 4 get value: VALUE
+2020/09/28 14:12:14 request 5 get value: VALUE
+2020/09/28 14:12:31 request 9 start to get and set cache...
+2020/09/28 14:12:31 request 9 is setting cache...
+2020/09/28 14:12:31 request 5 start to get and set cache...
+2020/09/28 14:12:31 request 6 start to get and set cache...
+2020/09/28 14:12:31 request 7 start to get and set cache...
+2020/09/28 14:12:31 request 8 start to get and set cache...
+2020/09/28 14:12:31 request 4 start to get and set cache...
+2020/09/28 14:12:31 request 2 start to get and set cache...
+2020/09/28 14:12:31 request 1 start to get and set cache...
+2020/09/28 14:12:31 request 3 start to get and set cache...
+2020/09/28 14:12:34 request 9 set cache success!
+2020/09/28 14:12:34 request 9 get value: VALUE
+2020/09/28 14:12:34 request 3 get value: VALUE
+2020/09/28 14:12:34 request 4 get value: VALUE
+2020/09/28 14:12:34 request 2 get value: VALUE
+2020/09/28 14:12:34 request 8 get value: VALUE
+2020/09/28 14:12:34 request 5 get value: VALUE
+2020/09/28 14:12:34 request 7 get value: VALUE
+2020/09/28 14:12:34 request 6 get value: VALUE
+2020/09/28 14:12:34 request 1 get value: VALUE
+
+Process finished with exit code 0
+
+```
+
+<font color=red size=5x>==每一次调用do都会重新开始，内存不会持久化支持的map集合==</font>
 
 
 
+#### docall 的简单使用
+
+```go
+package main
+
+import (
+	"errors"
+	"golang.org/x/sync/singleflight"
+	"log"
+	"time"
+)
+
+func main() {
+	var singleSetCache singleflight.Group
+
+	getAndSetCache := func(requestID int, cacheKey string) (string, error) {
+		log.Printf("request %v start to get and set cache...", requestID)
+		retChan := singleSetCache.DoChan(cacheKey, func() (ret interface{}, err error) {
+			log.Printf("request %v is setting cache...", requestID)
+			time.Sleep(3 * time.Second)
+			log.Printf("request %v set cache success!", requestID)
+			return "VALUE", nil
+		})
+
+		var ret singleflight.Result
+
+		timeout := time.After(5 * time.Second)
+
+		select { //加入了超时机制
+		case <-timeout:
+			log.Printf("time out!")
+			return "", errors.New("time out")
+		case ret = <-retChan: //从chan中取出结果
+			return ret.Val.(string), ret.Err
+		}
+		return "", nil
+	}
+
+	cacheKey := "cacheKey"
+	for i := 1; i < 10; i++ {
+		go func(requestID int) {
+			value, _ := getAndSetCache(requestID, cacheKey)
+			log.Printf("request %v get value: %v", requestID, value)
+		}(i)
+	}
+	time.Sleep(20 * time.Second)
+}
+
+```
+
+```
+2020/09/28 14:19:13 request 4 start to get and set cache...
+2020/09/28 14:19:13 request 2 start to get and set cache...
+2020/09/28 14:19:13 request 3 start to get and set cache...
+2020/09/28 14:19:13 request 8 start to get and set cache...
+2020/09/28 14:19:13 request 1 start to get and set cache...
+2020/09/28 14:19:13 request 9 start to get and set cache...
+2020/09/28 14:19:13 request 5 start to get and set cache...
+2020/09/28 14:19:13 request 7 start to get and set cache...
+2020/09/28 14:19:13 request 6 start to get and set cache...
+2020/09/28 14:19:13 request 4 is setting cache...
+2020/09/28 14:19:16 request 4 set cache success!
+2020/09/28 14:19:16 request 6 get value: VALUE
+2020/09/28 14:19:16 request 4 get value: VALUE
+2020/09/28 14:19:16 request 2 get value: VALUE
+2020/09/28 14:19:16 request 3 get value: VALUE
+2020/09/28 14:19:16 request 8 get value: VALUE
+2020/09/28 14:19:16 request 1 get value: VALUE
+2020/09/28 14:19:16 request 9 get value: VALUE
+2020/09/28 14:19:16 request 5 get value: VALUE
+2020/09/28 14:19:16 request 7 get value: VALUE
+
+Process finished with exit code 0
+
+
+```
+
+<font color=red size=5x>==每一次调用dochan都会重新开始，内存不会持久化支持的map集合,只不过将结果挡在chan中进行传输==</font>
+
+#### dochan源码
+
+```go
+func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result {
+   ch := make(chan Result, 1)
+   g.mu.Lock()
+   if g.m == nil {
+      g.m = make(map[string]*call)
+   }
+   if c, ok := g.m[key]; ok {
+      c.dups++
+      c.chans = append(c.chans, ch)//可以看到，每个等待的协程，都有一个结果channel。从之前的g.doCall里也可以看到，每个channel都给塞了结果。为什么不所有协程共用一个channel？因为那样就得在channel里塞至少与协程数量一样的结果数量，但是你却无法保证用户一个协程只读取一次。
+      g.mu.Unlock()
+      return ch
+   }
+   c := &call{chans: []chan<- Result{ch}}
+   c.wg.Add(1)
+   g.m[key] = c
+   g.mu.Unlock()
+
+   go g.doCall(c, key, fn)
+
+   return ch
+}
+```
 
 
 
+[singleflight](https://godoc.org/golang.org/x/sync/singleflight) 是 Go 语言扩展包中提供了另一种同步原语，这其实也是作者最喜欢的一种同步扩展机制，它能够在一个服务中抑制对下游的多次重复请求，一个比较常见的使用场景是 — 我们在使用 Redis 对数据库中的一些热门数据进行了缓存并设置了超时时间，缓存超时的一瞬间可能有非常多的并行请求发现了 Redis 中已经不包含任何缓存所以大量的流量会打到数据库上影响服务的延时和质量。
+
+![image-20200928105812664](data/image-20200928105812664.png)
+
+但是 <font color=red size=5x>`singleflight` 就能有效地解决这个问题，它的主要作用就是对于同一个 `Key` 最终只会进行一次函数调用，在这个上下文中就是只会进行一次数据库查询，查询的结果会写回 Redis 并同步给所有请求对应 `Key` 的用户：</font>
+
+![image-20200928105855825](data/image-20200928105855825.png)
+
+这其实就减少了对下游的瞬时流量，在获取下游资源非常耗时，例如：访问缓存、数据库等场景下就非常适合使用 `singleflight` 对服务进行优化，在上述的这个例子中我们就可以在想 Redis 和数据库中获取数据时都使用 `singleflight` 提供的这一功能减少下游的压力；它的使用其实也非常简单，我们可以直接使用 `singleflight.Group{}` 创建一个新的 `Group` 结构体，然后通过调用 `Do` 方法就能对相同的请求进行抑制：
+
+#### 结构体
+
+`Group` 结构体本身由一个互斥锁 `Mutex` 和一个从 `Key` 到 `call` 结构体指针的映射表组成，每一个 `call` 结构体都保存了当前这次调用对应的信息：
+
+```go
+type Group struct {
+    mu sync.Mutex
+    m  map[string]*call
+}
+type call struct {
+    wg sync.WaitGroup
+    val interface{}
+    err error
+    dups  int
+    chans []chan<- Result
+}
+```
+
+- <font color=red size=5x>`call` 结构体中的 `val` 和 `err` 字段都是在执行传入的函数时只会被赋值一次，它们也只会在 `WaitGroup` 等待结束都被读取，</font>
+
+- <font color=red size=5x>而 `dups` 和 `chans` 字段分别用于存储当前 `singleflight` 抑制的请求数量以及在结果返回时将信息传递给调用方。</font>
+
+#### 调用流程
+
+每次 `Do` 方法的调用时都会获取互斥锁并尝试对 `Group` 持有的映射表进行懒加载，随后判断是否已经存在 `key` 对应的函数调用：
+
+- 当不存在对应的`call`结构体时：
+  - 初始化一个新的 `call` 结构体指针；
+  - 增加 `WaitGroup` 持有的计数器；
+  - 将 `call` 结构体指针添加到映射表；
+  - 释放持有的互斥锁 `Mutex`；
+  - 阻塞地调用 `doCall` 方法等待结果的返回；
+- 当已经存在对应的`call`结构体时；
+  - 增加 `dups` 计数器，它表示当前重复的调用次数；
+  - 释放持有的互斥锁 `Mutex`；
+  - 通过 `WaitGroup.Wait` 等待请求的返回；
+
+```go
+func (g *Group) Do(key string, fn func() (interface{}, error)) (v interface{}, err error, shared bool) {
+    g.mu.Lock()
+    if g.m == nil {
+        g.m = make(map[string]*call)
+    }
+    if c, ok := g.m[key]; ok {
+        c.dups++
+        g.mu.Unlock()
+        c.wg.Wait()
+        return c.val, c.err, true
+    }
+    c := new(call)
+    c.wg.Add(1)
+    g.m[key] = c
+    g.mu.Unlock()
+    g.doCall(c, key, fn)
+    return c.val, c.err, c.dups > 0
+}
+```
+
+因为 `val` 和 `err` 两个字段都只会在 `doCall` 方法中被赋值，所以当 `doCall` 方法和 `WaitGroup.Wait` 方法返回时，这两个值就会返回给 `Do` 函数的调用者。
+
+```
+func (g *Group) doCall(c *call, key string, fn func() (interface{}, error)) {
+    c.val, c.err = fn()
+    c.wg.Done()
+    g.mu.Lock()
+    delete(g.m, key)
+    for _, ch := range c.chans {
+        ch <- Result{c.val, c.err, c.dups > 0}
+    }
+    g.mu.Unlock()
+}
+```
+
+`doCall` 中会运行传入的函数 `fn`，该函数的返回值就会赋值给 `c.val` 和 `c.err`，函数执行结束后就会调用 `WaitGroup.Done` 方法通知所有被抑制的请求，当前函数已经执行完成，可以从 `call` 结构体中取出返回值并返回了；在这之后，`doCall` 方法会获取持有的互斥锁并通过管道将信息同步给使用 `DoChan` 方法的调用方。
+
+```go
+func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result {
+    ch := make(chan Result, 1)
+    g.mu.Lock()
+    if g.m == nil {
+        g.m = make(map[string]*call)
+    }
+    if c, ok := g.m[key]; ok {
+        c.dups++
+        c.chans = append(c.chans, ch)
+        g.mu.Unlock()
+        return ch
+    }
+    c := &call{chans: []chan<- Result{ch}}
+    c.wg.Add(1)
+    g.m[key] = c
+    g.mu.Unlock()
+    go g.doCall(c, key, fn)
+    return ch
+}
+```
+
+`DoChan` 方法和 `Do`的区别就是，它使用 Goroutine 异步执行 `doCall` 并向 `call` 持有的 `chans` 切片中追加 `chan Result` 变量，这也是它能够提供异步传值的原因。
+
+# pool
+
+## 总结
+
+- <b><font color=red size=5x >pool是用来缓解Gc压力的，会在每次Gc之前全部清空pool，GC默认每两分钟一次</font></b>
+- <b><font color=green size=5x >在倒入 pool 包时执行的 init 函数会向 GC 注册 `poolCleanup` 函数，也就是在 GC 之前会运行该函数。</font></b>
+- <b><font color=green size=5x >pool 也存在私有队列为空的时候，从全局队列偷取一部分</font></b>
+
+- noCopy 保证是一个空结构，用来防止pool在第一次使用后被复制
+- 分为本地local 和 global 队列 来绑定P进行操作
+- poollocal 有pad 来防止`false sharding`
 
 
 
+## 流程图
 
+![img](data/0f877dd151d83415fd1dbd523742b527.png)
 
+为了使得在多个goroutine中高效的使用goroutine，sync.Pool为每个P(对应CPU)都分配一个本地池，当执行Get或者Put操作的时候，会先将goroutine和某个P的子池关联，再对该子池进行操作。 每个P的子池分为私有对象和共享列表对象，私有对象只能被特定的P访问，共享列表对象可以被任何P访问。因为同一时刻一个P只能执行一个goroutine，所以无需加锁，但是对共享列表对象进行操作时，因为可能有多个goroutine同时操作，所以需要加锁。
 
+值得注意的是poolLocal结构体中有个pad成员，目的是为了防止false sharing。cache使用中常见的一个问题是false sharing。当不同的线程同时读写同一cache line上不同数据时就可能发生false sharing。false sharing会导致多核处理器上严重的系统性能下降。具体的可以参考[伪共享(False Sharing)](http://ifeve.com/falsesharing/)。
 
+## false sharding
 
+缓存系统中是以缓存行（cache line）为单位存储的。缓存行是2的整数幂个连续字节，一般为32-256个字节。最常见的缓存行大小是64个字节。当多线程修改互相独立的变量时，如果这些变量共享同一个缓存行，就会无意中影响彼此的性能，这就是伪共享。缓存行上的写竞争是运行在SMP系统中并行线程实现可伸缩性最重要的限制因素。有人将伪共享描述成无声的性能杀手，因为从代码中很难看清楚是否会出现伪共享。
 
+<font color=red size =5x>为了让可伸缩性与线程数呈线性关系，就必须确保不会有两个线程往同一个变量或缓存行中写。两个线程写同一个变量可以在代码中发现。为了确定互相独立的变量是否共享了同一个缓存行，就需要了解内存布局</font>
 
+## 数据结构
 
+```go
+type Pool struct {
+    noCopy noCopy // noCopy 是一个空结构，用来防止 pool 在第一次使用后被复制
 
+    local     unsafe.Pointer // per-P pool, 实际类型为 [P]poolLocal
+    localSize uintptr        // local 的 size
 
+    // New 在 pool 中没有获取到，调用该方法生成一个变量
+    New func() interface{}
+}
 
+// 具体存储结构
+type poolLocalInternal struct {
+    private interface{}   // 只能由自己的 P 使用
+    shared  []interface{} // 可以被任何的 P 使用
+    Mutex                 // 保护 shared 线程安全
+}
+
+type poolLocal struct {
+    poolLocalInternal
+
+    // 避免缓存 false sharing，使不同的线程操纵不同的缓存行，多核的情况下提升效率。
+    pad [128 - unsafe.Sizeof(poolLocalInternal{})%128]byte
+}
+
+var (
+    allPoolsMu Mutex
+    allPools   []*Pool     // 池列表 
+)
+```
+
+- noCopy 保证是一个空结构，用来防止pool在第一次使用后被复制
+- 分为本地local 和 global 队列 来绑定P进行操作
+- poollocal 有pad 来防止`false sharding`
+
+## 主体流程
+
+## Put 方法
+
+Put 方法的整个流程比较简单，主要是将用完的对象放回池中，看一下注释就可以理解。
+
+- 获取当前私有队列，放入私有本地队列失败，放入全局队列
+
+```
+func (p *Pool) Put(x interface{}) {
+    ...
+    // 获取当前 P 的 pool
+    l := p.pin()
+    // 私有属性为空 放入
+    if l.private == nil {
+        l.private = x
+        x = nil
+    }
+    runtime_procUnpin()
+    // 私有属性放入失败 放入 shared 池
+    if x != nil {
+        l.Lock()
+        l.shared = append(l.shared, x)
+        l.Unlock()
+    }
+    ...
+}
+```
+
+## Get 方法
+
+我们找到对应的代码如下，
+
+```
+func (p *Pool) Get() interface{} {
+    ...
+    // 获取当前 P 的 poolLocal
+    l := p.pin()
+    // 先从 private 读取
+    x := l.private
+    l.private = nil
+    runtime_procUnpin()
+    // private 没有
+    if x == nil {
+        l.Lock()
+        // 从当前 P 的 shared 末尾取一个
+        last := len(l.shared) - 1
+        if last >= 0 {
+            x = l.shared[last]
+            l.shared = l.shared[:last]
+        }
+        l.Unlock()
+        // 还没有取到 则去其他 P 的 shared 取
+        if x == nil {
+            x = p.getSlow()
+        }
+    }
+    ...
+    // 最后还没取到 调用 NEW 方法生成一个
+    if x == nil && p.New != nil {
+        x = p.New()
+    }
+    return x
+}
+```
+
+上面有一个 `p.getSlow()` 操作是说从其他的 P 中偷取一个，比较有意思，在 Go 的GMP模型中也存在这个偷的概念，基本和这个类似。我们来看看
+
+```
+func (p *Pool) getSlow() (x interface{}) {
+    ...
+    // 尝试从其他 P 中窃取一个元素。
+    pid := runtime_procPin()
+    runtime_procUnpin()
+    for i := 0; i < int(size); i++ {
+        // 获取其他 P 的 poolLocal
+        l := indexLocal(local, (pid+i+1)%int(size))
+        l.Lock()
+        last := len(l.shared) - 1
+        if last >= 0 {
+            x = l.shared[last]
+            l.shared = l.shared[:last]
+            l.Unlock()
+            break
+        }
+        l.Unlock()
+    }
+    return x
+}
+```
+
+## 存活周期以及内存回收
+
+在倒入 pool 包时执行的 init 函数会向 GC 注册 `poolCleanup` 函数，也就是在 GC 之前会运行该函数。
+
+```
+func init() {
+    runtime_registerPoolCleanup(poolCleanup)
+}
+```
+
+我们来看看 poolCleanup，该函数主要是将所有池的变量解除引用，为下一步的 GC 作准备。
+
+```
+func poolCleanup() {
+    // 在 GC 时会调用此函数。
+    // 它不能分配，也不应该调用任何运行时函数。
+    // 防御性地将所有东西归零，原因有两个：
+    // 1. 防止整个池的错误保留。
+    // 2. 如果GC发生时goroutine与Put / Get中的l.shared一起使用，它将保留整个Pool。因此下一周期内存消耗将增加一倍。
+    for i, p := range allPools {
+        // 将所有池对象接触引用 等待 GC 回收
+        allPools[i] = nil
+        for i := 0; i < int(p.localSize); i++ {
+            l := indexLocal(p.local, i)
+            l.private = nil
+            for j := range l.shared {
+                l.shared[j] = nil
+            }
+            l.shared = nil
+        }
+        p.local = nil
+        p.localSize = 0
+    }
+    allPools = []*Pool{}
+}
+```
+
+整个流程图
 
 
 
