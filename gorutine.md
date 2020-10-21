@@ -114,47 +114,107 @@
 
 
 
+# ==----------helloword执行流程------==
+
+
+
+![image-20201015214056687](gorutine.assets/image-20201015214056687.png)
 
 
 
 
 
+- <font color=blue size=6x>hello word 程序被编译成可执行文件`加载到内存中`</font>
+- <font color=blue size=6x>对于程序执行空间中的代码段,`重要的是程序执行入口`,不同平台执行入口不一样</font>
+
+
+
+![image-20201015214808758](gorutine.assets/image-20201015214808758.png)
+
+
+
+- <font color=blue size=6x>在进行一系列的程序代码检查和初始化之后会已runtime.main为程序执行入口`创建main goroutine`</font>
+- <font color=blue size=6x>main goutine 执行以后才会调用我们编写的main.main</font>
+
+
+
+<font color =red size=6x backgroud=yellow>数据段</font>
+
+![image-20201015215524417](gorutine.assets/image-20201015215524417.png)
+
+全局变量 g0。m0
+
+- <font color=blue size=6x>协程对应的数据结构是runtime.g,`工作线程对应的是runtime.m`,`全局变量g0就是主协程对应的g,全局变量m0就是主线程对应的m`</font>
+- <font color=blue size=6x>与其他协程不同的是,他的协程栈 是由主线程栈上分配的</font>
+- <font color=blue size=6x>G0 持有m0的指针,m0 也记录着g0的指针,`而且一开始m0上执行的协程正是g0`</font>
+- <font color=blue size=6x>全局变量allgs记录着所有的g,allm用于记录所有的m.==全局变量sched(代表的是调度器,数据结构示runtime.schedt,`记录所有空闲的m,空闲的p,全局队列runq等`)全局变量allp记录所有的P==</font>
+
+## GMP 模型
+
+一开始调度模型只有MG,但是因为频繁的加锁和解锁带来很大的资源消耗
+
+![image-20201015215732273](gorutine.assets/image-20201015215732273.png)
+
+
+
+![image-20201015220452711](gorutine.assets/image-20201015220452711.png)
+
+- <font color=red size=5x>每个M和本地的自己的P绑定,这样可以避免只有一个p带来的加锁和解锁的性能消耗</font>
+- <font color=red size=5x>还有一个全局队列P,用于所有的P满了之后放入全局P中</font>
+- <font color=red size=5x>M先从关联的本地队列中获取,如果没有的话在到全局队列领取一些任务,全局都没有就会随机窃取其他P的任务放入本地队列</font>
 
 
 
 
 
+<font color=red size=5x>==p的创建过程==</font>
+
+- <font color=red size=5x>全局变量allp记录所有的p</font>
+- <font color=red size=5x>程序初始化的时候会进行调度器初始化,这时会根据GOMAXPROCS环境变量来创建P的个数,`并将allp[0]和m[0]绑定建立关系`</font>
+
+<font color=red size=5x>==main goroutin创建之前GPM关系==</font>
+
+![image-20201021224218642](gorutine.assets/image-20201021224218642.png)
 
 
 
 
 
+<font color=red size=5x>==程序初始化==</font>
+
+- <font color=red size=5x>队列里只有main goutine 切换到main goutine</font>
+- <font color=red size=5x>执行入口是runtime.main,会创建==监控线程,进行包初始化等,然后调用main.main,输出hello word==</font>
+- <font color=red size=5x>在mian.main返回之后会调用exit()退出结束进程</font>
+
+![image-20201021224730658](gorutine.assets/image-20201021224730658.png)
+
+<font color=red size=5x>==通过协程输出hello word过程==</font>
+
+![image-20201021224824821](gorutine.assets/image-20201021224824821.png)
+
+- <font color=red size=5x>当main.main被执行时就会创建一个新的goroutie</font>
+- <font color=red size=5x>会被编译器转为newproc函数调用,调用时,之后给入口和参数,而newproc函数会给goroutine创建一个栈帧,==目的是让协程结束后,返回到goexit中,进行协程资源回收==</font>
 
 
 
+<font color=red size=5x>==协程返回以后怎么样了==</font>
 
+协程返回后怎么样了,是被回收了吗
 
+- <font color=red size=5x>如果只有一个main.goroutine,那么执行完毕后后调用exit函数,释放空间内存,进行资源回收</font>
 
+- <font color=red size=5x>时候time.sleep 会将main.goroutine放入等待队列,为waiting状态,其他写成得以执行,等到sleep执行之后,time会把main goroutine重新置为——Grunnable状态,==放回到runq的队列中,再然后就结束了,exit调用,进程退出,这是只有一个p的情况==</font>
 
+  ![image-20201021225758278](gorutine.assets/image-20201021225758278.png)
 
+  
 
+<font color=red size=5x>==创建多个p的退出==</font>
 
+- <font color=red size=5x>默认会加到当前p的本地队列</font>
+- <font color=red size=5x>有空闲p的情况下,就可以启动新的==线程关联这个p,并把hello goroutine 放入到本地队列中===</font>
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+![image-20201021230533419](gorutine.assets/image-20201021230533419.png)
 
 
 
