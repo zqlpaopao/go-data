@@ -220,15 +220,44 @@
 
 
 
+# ==----协程的创建、让出、和恢----==
+
+<font color=red size=5x>创建的协程会交给`newproc`来执行</font>
+
+<font color=red size=5x>main函数的栈帧分配在main goroutine的协程栈中</font>
+
+<font color=red size=5x>==栈帧布局,call函数返回之后是调用者栈基---然后是局部变量空间以及调用其他函数传递的`返回值`和`参数`的区间==</font>
+
+<font color=blue size=5x>main 函数有局部变量name,接下来要调用newproc函数</font>
+
+<font color=red size=5x>`newproc接受两个参数,第一个是传递给协程入口函数的参数占多少字节`,`第二个是协程入口函数对应的funval指针`,在参数空间内要入栈两个参数,由右至左,==局部变量name要拷贝到协程的栈空间</font>
+
+<font color=blue size=5x>下面是函数的返回地址,然后是newproc函数的栈帧了</font>
+
+
+
+![image-20201022213123435](gorutine.assets/image-20201022213123435.png)
 
 
 
 
 
+<font color=red size=5x>==newproc函数的作用==</font>
+
+<font color=red size=5x>newproc函数切换到g0栈调用newproc1函数</font>
+
+<font color=blue size=6x><b>为什么切换到g0栈,简单来说,防止栈溢出</b></font>
+
+- g0栈空间没有no-split标记,很多其他函数都是有这个标记的,这个标记表明不支持栈增长
+- <font color=blue size=6x><b>g0的栈直接分配在线程栈上,栈空间足够大</b></font>
+
+![image-20201022214626974](gorutine.assets/image-20201022214626974.png)
 
 
 
 
+
+<font color=red size=5x>==newproc1函数的作用==</font>
 
 
 

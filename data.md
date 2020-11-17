@@ -3775,19 +3775,335 @@ func poolCleanup() {
 
 
 
+# Map
+
+**写：直写。
+读：先读read，没有再读dirty。**
+
+![image-20201117223604947](data.assets/image-20201117223604947.png)
 
 
 
 
 
+## 数据结构
+
+```
+type Map struct {
+    // 当涉及到脏数据(dirty)操作时候，需要使用这个锁
+    mu Mutex
+    
+    // read是一个只读数据结构，包含一个map结构，
+    // 读不需要加锁，只需要通过 atomic 加载最新的指正即可
+    read atomic.Value // readOnly
+    
+    // dirty 包含部分map的键值对，如果操作需要mutex获取锁
+    // 最后dirty中的元素会被全部提升到read里的map去
+    dirty map[interface{}]*entry
+    
+    // misses是一个计数器，用于记录read中没有的数据而在dirty中有的数据的数量。
+    // 也就是说如果read不包含这个数据，会从dirty中读取，并misses+1
+    // 当misses的数量等于dirty的长度，就会将dirty中的数据迁移到read中
+    misses int
+}
+
+```
+
+
+
+readOnly的数据结构：
+
+```
+// readOnly is an immutable struct stored atomically in the Map.read field.
+type readOnly struct {
+    // m包含所有只读数据，不会进行任何的数据增加和删除操作 
+    // 但是可以修改entry的指针因为这个不会导致map的元素移动
+    m       map[interface{}]*entry
+    
+    // 标志位，如果为true则表明当前read只读map的数据不完整，dirty map中包含部分数据
+    amended bool // true if the dirty map contains some key not in m.
+}
+```
+
+只读map，对该map的访问不需要加锁，但是这个map也不会增加元素，元素会被先增加到dirty中，然后后续会迁移到read只读map中，通过原子操作所以不需要加锁操作。
+
+
+
+entry的数据结构：
+
+```
+type entry struct {
+    //可见value是个指针类型，虽然read和dirty存在冗余情况（amended=false），但是由于是指针类型，存储的空间应该不是问题
+    p unsafe.Pointer // *interface{}
+}
+
+```
+
+p有三种值：
+
+- nil: entry已被删除了，并且m.dirty为nil
+- expunged: entry已被删除了，并且m.dirty不为nil，而且这个entry不存在于m.dirty中
+- 其它： entry是一个正常的值
+
+## 查询
+
+- <font color=red size=5x>更新的时候会把read.amended置为true</font>
+
+- <font color=red size=5x>查询先从readOnly中直接读取,如果有,就直接返回,没有的话,并且read.amended为true,说明有更新.加锁,==再次读取,然后没有的话,从dirty读取==</font>
+- <font color=red size=5x>==无论dirty有没有,都会misses+1==,当messes=<len(dirty)的时候将dirty的置为readOnly,并且dirty为nil</font>
+
+```
+// src/sync/map.go
+
+// Load returns the value stored in the map for a key, or nil if no
+// value is present.
+// The ok result indicates whether value was found in the map.
+func (m *Map) Load(key interface{}) (value interface{}, ok bool) {
+    // 首先从只读ready的map中查找，这时不需要加锁
+    read, _ := m.read.Load().(readOnly)
+    e, ok := read.m[key]
+    
+    // 如果没有找到，并且read.amended为true，说明dirty中有新数据，从dirty中查找，开始加锁了
+    if !ok && read.amended {
+        m.mu.Lock() // 加锁
+        
+       // 又在 readonly 中检查一遍，因为在加锁的时候 dirty 的数据可能已经迁移到了read中
+        read, _ = m.read.Load().(readOnly)
+        e, ok = read.m[key]
+        
+        // read 还没有找到，并且dirty中有数据
+        if !ok && read.amended {
+            e, ok = m.dirty[key] //从 dirty 中查找数据
+            
+            // 不管m.dirty中存不存在，都将misses + 1
+            // missLocked() 中满足条件后就会把m.dirty中数据迁移到m.read中
+            m.missLocked()
+        }
+        m.mu.Unlock()
+    }
+    if !ok {
+        return nil, false
+    }
+    return e.load()
+}
+```
+
+从函数可以看出，如果查询的键值正好在m.read中，不需要加锁，直接返回结果，优化了性能。
+即使不在read中，经过几次miss后， m.dirty中的数据也会迁移到m.read中，这时又可以从read中查找。
+所以对于更新／增加较少，加载存在的key很多的case，性能基本和无锁的map类似。
+
+```
+// src/sync/map.go
+
+func (m *Map) missLocked() {
+    m.misses++
+    if m.misses < len(m.dirty) {//misses次数小于 dirty的长度，就不迁移数据，直接返回
+        return
+    }
+    m.read.Store(readOnly{m: m.dirty}) //开始迁移数据
+    m.dirty = nil   //迁移完dirty就赋值为nil
+    m.misses = 0  //迁移完 misses归0
+}
+```
 
 
 
 
 
+![image-20201117224413174](data.assets/image-20201117224413174.png)
 
 
 
+## 新增和更新
+
+- <font color=red size=5x>更新的时候==先查看read中是否有,有的话就更新值,更新的时候entity更新==</font>
+- <font color=red size=5x>不存在read中,存在于dirty中直接更新,直接更新dirty</font>
+- <font color=red size=5x>==如果dirty也没有,新增此时也是将ameded置为true的==</font>
+
+```
+// src/sync/map.go
+
+// Store sets the value for a key.
+func (m *Map) Store(key, value interface{}) {
+   // 直接在read中查找值，找到了，就尝试 tryStore() 更新值
+    read, _ := m.read.Load().(readOnly)
+    if e, ok := read.m[key]; ok && e.tryStore(&value) {
+        return
+    }
+    
+    // m.read 中不存在
+    m.mu.Lock()
+    read, _ = m.read.Load().(readOnly)
+    if e, ok := read.m[key]; ok {
+        if e.unexpungeLocked() { // 未被标记成删除，前面讲到entry数据结构时，里面的p值有3种。1.nil 2.expunged，这个值含义有点复杂，可以看看前面entry数据结构 3.正常值
+            
+            m.dirty[key] = e // 加入到dirty里
+        }
+        e.storeLocked(&value) // 更新值
+    } else if e, ok := m.dirty[key]; ok { // 存在于 dirty 中，直接更新
+        e.storeLocked(&value)
+    } else { // 新的值
+        if !read.amended { // m.dirty 中没有新数据，增加到 m.dirty 中
+            // We're adding the first new key to the dirty map.
+            // Make sure it is allocated and mark the read-only map as incomplete.
+            m.dirtyLocked() // 从 m.read中复制未删除的数据
+            m.read.Store(readOnly{m: read.m, amended: true}) 
+        }
+        m.dirty[key] = newEntry(value) //将这个entry加入到m.dirty中
+    }
+    m.mu.Unlock()
+}
+
+/ 将read中未删除的数据加入到dirty中
+func (m *Map) dirtyLocked() {
+    if m.dirty != nil {
+        return
+    }
+    
+    read, _ := m.read.Load().(readOnly)
+    m.dirty = make(map[interface{}]*entry, len(read.m))
+    
+    // 遍历read。
+    for k, e := range read.m {
+        // 通过此次操作，dirty中的元素都是未被删除的，可见标记为expunged的元素不在dirty中！！！
+        if !e.tryExpungeLocked() {
+            m.dirty[k] = e
+        }
+    }
+}
+
+// 判断entry是否被标记删除，并且将标记为nil的entry更新标记为expunge
+func (e *entry) tryExpungeLocked() (isExpunged bool) {
+    p := atomic.LoadPointer(&e.p)
+    
+    for p == nil {
+        // 将已经删除标记为nil的数据标记为expunged
+        if atomic.CompareAndSwapPointer(&e.p, nil, expunged) {
+            return true
+        }
+        p = atomic.LoadPointer(&e.p)
+    }
+    return p == expunged
+}
+
+// 对entry尝试更新 （原子cas操作）
+func (e *entry) tryStore(i *interface{}) bool {
+    p := atomic.LoadPointer(&e.p)
+    if p == expunged {
+        return false
+    }
+    for {
+        if atomic.CompareAndSwapPointer(&e.p, p, unsafe.Pointer(i)) {
+            return true
+        }
+        p = atomic.LoadPointer(&e.p)
+        if p == expunged {
+            return false
+        }
+    }
+}
+
+// read里 将标记为expunge的更新为nil
+func (e *entry) unexpungeLocked() (wasExpunged bool) {
+    return atomic.CompareAndSwapPointer(&e.p, expunged, nil)
+}
+
+// 更新entry
+func (e *entry) storeLocked(i *interface{}) {
+    atomic.StorePointer(&e.p, unsafe.Pointer(i))
+}
+```
+
+操作都是先从m.read开始，不满足条件再加锁，然后操作m.dirty。
+
+![image-20201117232458978](data.assets/image-20201117232458978.png)
+
+这边有几个点需要强调一下：
+
+> 1. read中的标记为已删除的区别？
+
+标记为nil，说明是正常的delete操作，此时dirty中不一定存在
+a. dirty赋值给read后，此时dirty不存在
+b. dirty初始化后，肯定存在
+
+标记为expunged，说明是在dirty初始化的时候操作的，此时dirty中肯定不存在。
+
+> 1. 可能存在性能问题？
+
+初始化dirty的时候，虽然都是指针赋值，但read如果较大的话，可能会有些影响。
+
+
+
+## 删除
+
+```
+// src/sync/map.go
+
+// Delete deletes the value for a key.
+func (m *Map) Delete(key interface{}) {
+    // 从 m.read 中开始查找
+    read, _ := m.read.Load().(readOnly)
+    e, ok := read.m[key]
+     // 如果read中没有，并且dirty中有新元素，那么就去dirty中去找。这里用到了amended，当read与dirty不同时为true，说明dirty中有read没有的数据。
+    
+    if !ok && read.amended { // m.read中没有找到，并且可能存在于m.dirty中，加锁查找
+        m.mu.Lock() // 加锁
+        //再检查一次，因为前文的判断和锁不是原子操作，防止期间发生了变化。
+        read, _ = m.read.Load().(readOnly) // 再在m.read中查找一次
+        e, ok = read.m[key]
+        if !ok && read.amended { //m.read中又没找到，amended标志位true，说明在m.dirty中
+            delete(m.dirty, key) // 删除
+        }
+        m.mu.Unlock()
+    }
+    if ok { // 在 m.ready 中就直接删除
+    如果read中存在该key，则将该value 赋值nil（采用标记的方式删除！）
+        e.delete()
+    }
+}
+
+func (e *entry) delete() (hadValue bool) {
+    for {
+    	// 再次再一把数据的指针
+        p := atomic.LoadPointer(&e.p)
+        if p == nil || p == expunged {
+            return false
+        }
+        
+        // 原子操作
+        if atomic.CompareAndSwapPointer(&e.p, p, nil) {
+            return true
+        }
+    }
+}
+```
+
+
+
+![image-20201117232252088](data.assets/image-20201117232252088.png)
+
+
+
+这边有几个点需要强调一下：
+
+> 1.为什么dirty是直接删除，而read是标记删除？
+
+read的作用是在dirty前头优先度，遇到相同元素的时候为了不穿透到dirty，所以采用标记的方式。
+同时正是因为这样的机制+amended的标记，可以保证read找不到&&amended=false的时候，dirty中肯定找不到
+
+> 2.为什么dirty是可以直接删除，而没有先进行读取存在后删除？
+
+删除成本低。读一次需要寻找，删除也需要寻找，无需重复操作。
+
+> 3.如何进行标记的？
+
+将值置为nil。（这个很关键）
+
+
+
+## current-map
+
+https://github.com/orcaman/concurrent-map
 
 
 
