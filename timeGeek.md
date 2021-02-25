@@ -270,6 +270,237 @@ for 循环是不断尝试获取锁，如果获取不到，就通过 runtime.Sema
 
 
 
+# sync.Pool
+
+## 1、false sharding
+
+>  系统缓存是以行为存储单位的（cache line）为单位存储的，缓存行是2的整数幂个连续字节，一般为32-256个字节，最常见的缓存行大小为64个字节或者128个字节
+>
+> 当系统中`多线程修改相互独立变量时`，如果这些变量共享同一个缓存行，就会无意中影响彼此的性能，这就是伪共享。
+>
+> 伪共享是运行在SMP系统中并行线程实现可伸缩性最重要的限制因素，无声的杀手
+>
+> 我们暂且知道这个，后面会用到
+
+
+
+## 2、数据结构
+
+Go 1.13之后
+
+```go
+type Pool struct {
+	noCopy noCopy //noCopy 是一个空结构，用来防止 pool 在第一次使用后被复制
+
+	local     unsafe.Pointer // local fixed-size per-P pool, actual type is [P]poolLocal，per-P pool, 实际类型为 [P]poolLocal
+	localSize uintptr        // size of the local array，local size
+
+	victim     unsafe.Pointer // local from previous cycle 上一个周期的本地的待回收对象
+	victimSize uintptr        // size of victims array
+
+	// New optionally specifies a function to generate
+	// a value when Get would otherwise return nil.
+	// It may not be changed concurrently with calls to Get.
+	New func() interface{}
+}
+
+// Local per-P Pool appendix.
+type poolLocalInternal struct {
+	private interface{} // Can be used only by the respective P.//私有本地池
+	shared  poolChain   // Local P can pushHead/popHead; any P can popTail. 公有池
+}
+
+type poolLocal struct {
+	poolLocalInternal
+
+	// Prevents false sharing on widespread platforms with
+	// 128 mod (cache line size) = 0 . 避免缓存 false sharing，使不同的线程操纵不同的缓存行，多核的情况下提升效率。
+	pad [128 - unsafe.Sizeof(poolLocalInternal{})%128]byte
+}
+```
+
+Go1.13 之前
+
+```go
+type Pool struct {
+    noCopy noCopy // noCopy 是一个空结构，用来防止 pool 在第一次使用后被复制
+
+    local     unsafe.Pointer // per-P pool, 实际类型为 [P]poolLocal
+    localSize uintptr        // local 的 size
+
+    // New 在 pool 中没有获取到，调用该方法生成一个变量
+    New func() interface{}
+}
+
+// 具体存储结构
+type poolLocalInternal struct {
+    private interface{}   // 只能由自己的 P 使用
+    shared  []interface{} // 可以被任何的 P 使用,使用的时候需要加锁
+    Mutex                 // 保护 shared 线程安全
+}
+
+type poolLocal struct {
+    poolLocalInternal
+
+    // 避免缓存 false sharing，使不同的线程操纵不同的缓存行，多核的情况下提升效率。
+    pad [128 - unsafe.Sizeof(poolLocalInternal{})%128]byte
+}
+
+var (
+    allPoolsMu Mutex
+    allPools   []*Pool     // 池列表 
+)
+
+```
+
+以上数据结构我们可以知道
+
+> 1. <font color=red size=5x>**本地池-poolLocal**</font>
+>
+>    sync.Pool 为每个P（对应CPU）都分配一个本地池。当进行get或者put的时候，会先将goroutine和某个P的子池关联，在对子池操作，后面我们来验证
+>
+> 2. <font color=red size=5x>**本地池分为私有对象和共有对象**</font>
+>
+>    私有对象` private interface{}`只能自己的P使用，而且同一时刻P运行的肯定只有一个goroutine，==可以看到只能存放一个复用对象==
+>
+>    公有对象 `shared  []interface{}`可以被任何的P使用，使用的时候需要加锁
+>
+> 3. <font color=red size=5x>**poolLocal中的pad**</font>
+>
+>    poolLocal中有个pad成员，目的是为了防止false sharding，将剩余的cache line 占用，也可以看出golang的线程cache line是128字节
+>
+> 4. <font color=red size=5x>**victim老生代回收站，去除mutex锁**</font>
+>
+>    victim有点像java垃圾回收策略的新生代，如果有在被使用的对象，就会放回到local中，如果没有，垃圾回收的时候就会被移除
+
+## 3、回收逻辑
+
+```go
+
+func poolCleanup() {
+    // 直接丢弃当前victim，因为victim没有使用的，是从local拷贝过来的，没有锁操作
+    for _, p := range oldPools {
+        p.victim = nil
+        p.victimSize = 0
+    }
+
+    // 将local复制给victim, 并将原local置为nil
+    for _, p := range allPools {
+        p.victim = p.local
+        p.victimSize = p.localSize
+        p.local = nil
+        p.localSize = 0
+    }
+
+    oldPools, allPools = allPools, nil
+}
+```
+
+
+
+```go
+// Implemented in runtime.
+func runtime_registerPoolCleanup(cleanup func())
+```
+
+在runtime中实现，每次gc的时候都会进行清理和复制，==其实也就是清理local的信息，间接证明sync.Pool减小GC压力是避免频繁的申请内存和释放内存==
+
+
+
+## 4、Get 源码
+
+```go
+func (p *Pool) Get() interface{} {
+	if race.Enabled {
+		race.Disable()
+	}
+  //将运行的goroutine和P绑定
+	l, pid := p.pin()
+  //尝试从私有对象获取，并将私有对象nil
+	x := l.private
+	l.private = nil
+  //如果私有对象为nil，从公有对象池中获取，头部获取
+	if x == nil {
+		// Try to pop the head of the local shard. We prefer
+		// the head over the tail for temporal locality of
+		// reuse.
+		x, _ = l.shared.popHead()
+    //如果公有池还是没有尝试去其他P的公有池获取一个
+		if x == nil {
+			x = p.getSlow(pid)
+		}
+	}
+	runtime_procUnpin()
+ 
+	if race.Enabled {
+		race.Enable()
+		if x != nil {
+			race.Acquire(poolRaceAddr(x))
+		}
+	}
+  //最后无论私有、公有、还是其他共享池都没有，那就只能自己创建一个
+	if x == nil && p.New != nil {
+		x = p.New()
+	}
+	return x
+}
+```
+
+
+
+>1. 优先从自己的本地私有local获取，只有一个，同一时刻P只能运行一个goroutine，速度是最快的
+>2. 如果私有对象没有，那么获取共享池的从头部弹出一个`CompareAndSwapUint64`原子操作的置换
+>3. 如果公有池也没有，那么去其他P的shard获取一个
+>4. 最后都没有，那么就只能自己创建一个
+
+### 去其他池获取过程
+
+```go
+func (p *Pool) getSlow(pid int) interface{} {
+	// See the comment in pin regarding ordering of the loads.
+	size := atomic.LoadUintptr(&p.localSize) // load-acquire
+	locals := p.local                        // load-consume
+	// Try to steal one element from other procs.
+  //尝试从其他的P中偷取一个
+	for i := 0; i < int(size); i++ {
+		l := indexLocal(locals, (pid+i+1)%int(size))
+		if x, _ := l.shared.popTail(); x != nil {
+			return x
+		}
+	}
+
+	// Try the victim cache. We do this after attempting to steal
+	// from all primary caches because we want objects in the
+	// victim cache to age out if at all possible.
+  //如果获取的还是nil，那么就从victim中试试
+	size = atomic.LoadUintptr(&p.victimSize)
+	if uintptr(pid) >= size {
+		return nil
+	}
+	locals = p.victim
+	l := indexLocal(locals, pid)
+	if x := l.private; x != nil {
+		l.private = nil//优先从vimtic的私有池中获取
+		return x
+	}
+	for i := 0; i < int(size); i++ {//从victim的其他P尝试获取
+		l := indexLocal(locals, (pid+i)%int(size))
+		if x, _ := l.shared.popTail(); x != nil {
+			return x
+		}
+	}
+
+	// Mark the victim cache as empty for future gets don't bother
+	// with it.
+  //如果没有就标记为nil
+	atomic.StoreUintptr(&p.victimSize, 0)
+
+	return nil
+}
+```
+
+
+
 
 
 
