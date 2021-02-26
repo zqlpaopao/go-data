@@ -272,6 +272,22 @@ for 循环是不断尝试获取锁，如果获取不到，就通过 runtime.Sema
 
 # sync.Pool
 
+## 回顾总结
+
+看文这篇文章，我们来总结一下精华
+
+> 1. <font color=red size=5x>**sync.Pool是用来缓解频繁的申请内存和缓解因此带来的GC压力的**</font>
+> 2. <font color=green size=5x>**在导入pool包时候init会箱GC注册`poolCleanup`函数，也就是在GC执勤啊运行此函数**</font>
+> 3. <font color=red size=5x>**P有私有对象池（一个对象位置），公有对象池（多个）**</font>
+>    1. 优先从自己的本地私有local获取，只有一个，同一时刻P只能运行一个goroutine，速度是最快的
+>    2. 如果私有对象没有，那么获取共享池的从头部弹出一个`CompareAndSwapUint64`原子操作的置换
+>    3. 如果公有池也没有，那么去其他P的shard获取一个
+>    4. 最后都没有，那么就只能自己创建一个
+> 4. <font color=red】 size=5x>**go1.13之后用victim代替mutex锁，GC的时候会直接释放victim，如果victim中对象再次被使用，会返回到存活对象中**</font>
+> 5. <font color=red size=5x>**noCopy保证是一个空结构，用来防止pool在第一次使用后被复制**</font>
+> 6. <font color=block size=5x>**poolLocal有pad来防止sharding**</font>
+> 7. <font color=red size=5x>**每次GC的将victim设置为空，将原来的local给到victim中**</font>
+
 ## 1、false sharding
 
 >  系统缓存是以行为存储单位的（cache line）为单位存储的，缓存行是2的整数幂个连续字节，一般为32-256个字节，最常见的缓存行大小为64个字节或者128个字节
@@ -376,7 +392,7 @@ var (
 ## 3、回收逻辑
 
 ```go
-
+//此操作在GC的时候出发，直接释放掉victim
 func poolCleanup() {
     // 直接丢弃当前victim，因为victim没有使用的，是从local拷贝过来的，没有锁操作
     for _, p := range oldPools {
@@ -396,7 +412,7 @@ func poolCleanup() {
 }
 ```
 
-
+> <font color=red size=5x>**每次GC的将victim设置为空，将原来的local给到victim中**</font>
 
 ```go
 // Implemented in runtime.
@@ -499,7 +515,89 @@ func (p *Pool) getSlow(pid int) interface{} {
 }
 ```
 
+## 5、Put源码
 
+```go
+func (p *Pool) Put(x interface{}) {
+	if x == nil {
+		return
+	}
+	if race.Enabled {
+		if fastrand()%4 == 0 {
+			// Randomly drop x on floor.
+			return
+		}
+		race.ReleaseMerge(poolRaceAddr(x))
+		race.Disable()
+	}
+	l, _ := p.pin()
+  //如果本地队列为nil，设置本地队列
+	if l.private == nil {
+		l.private = x
+		x = nil
+	}
+  //如果本地队列不为nil，加入shard中，从头部加入，记得弹出的时候也会从头部弹出
+	if x != nil {
+		l.shared.pushHead(x)
+	}
+	runtime_procUnpin()
+	if race.Enabled {
+		race.Enable()
+	}
+}
+```
+
+
+
+> put 的逻辑是优先设置P的本地队列，因为本地私有队列只有一个位置，如果不为空，那么就加入P的共享池中
+
+
+
+## 6、内存泄漏问题
+
+看极客大佬鸟窝的一个案例
+
+```go
+var buffers = sync.Pool{
+  New: func() interface{} { 
+    return new(bytes.Buffer)
+  },
+}
+
+func GetBuffer() *bytes.Buffer {
+  return buffers.Get().(*bytes.Buffer)
+}
+
+func PutBuffer(buf *bytes.Buffer) {
+  buf.Reset()
+  buffers.Put(buf)
+}
+```
+
+案例是很简单，设置buffer，然后返回
+
+这样会有什么问题呢？
+
+没有指定获取和返回的buffer大小，如果put的时候的buffer远远大于初始的buffer大小，且一直增涨的趋势，那么就会造成内存泄漏
+
+> 最好是指定池子buffer的大小，get的时候根据需要获取对应的池子buffer，put的时候校验buffer的大小，避免内存泄漏
+
+
+
+## 7、内存浪费
+
+还有很多场景是池子的buffer很大，但是我嗯只需要很小的buffer，造成了浪费
+
+> 我们可以设置多个固定大小的，按需获取
+
+在标准库中net/http/server.go中就存在2k和4k的两个write池子
+
+## 8、第三方库
+
+```go
+ bytebufferpool    https://github.com/valyala/bytebufferpool
+ oxtoacart/bpool    https://github.com/oxtoacart/bpool
+```
 
 
 
